@@ -1,0 +1,58 @@
+[Unit]
+Description=Pickle relay port-forwarding agent (nftables DNAT convergence)
+Documentation=https://github.com/pnuops/pickle-relay-agent
+# nftables.service loads the static plumbing table at boot; the agent only
+# ever writes its own table, but ordering keeps first-boot logs sane.
+After=network-online.target nftables.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pickle-relay
+Group=pickle-relay
+# Deployment-specific values (target CIDR, band, public interface, poll) —
+# the agent fails closed if any firewall-shaping variable is missing.
+EnvironmentFile=/etc/pickle/relay-agent.env
+ExecStart=/opt/pickle/relay-agent/bin/relay-agent run
+Restart=on-failure
+RestartSec=5s
+StateDirectory=pickle-relay-agent
+StateDirectoryMode=0750
+UMask=0077
+
+# Privileges: nftables writes over netlink need CAP_NET_ADMIN; nothing else.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+# Hardening. The agent spawns NO child processes (netlink direct, no nft(8)
+# exec), which is what allows SystemCallFilter and MemoryDenyWriteExecute —
+# do not add exec'd helpers without revisiting this block.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+# AF_NETLINK: nftables. AF_INET/AF_INET6: the sync poll (transport milestone).
+RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# 512 MB host: keep the agent's footprint hard-bounded.
+LimitNOFILE=256
+TasksMax=16
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
