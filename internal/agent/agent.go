@@ -45,7 +45,7 @@ func (a *Agent) BootReapply() error {
 	s, err := snapshot.LoadPersisted(path, a.cfg.Limits, a.cfg.SnapshotMaxAge, time.Now())
 	switch {
 	case err == nil:
-		if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s)); err != nil {
+		if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 			return fmt.Errorf("boot re-apply: %w", err)
 		}
 		a.appliedGeneration, a.applied = s.Generation, true
@@ -59,7 +59,7 @@ func (a *Agent) BootReapply() error {
 		a.log.Warn("persisted snapshot rejected; converging to empty set", "reason", err)
 		_ = os.Remove(path)
 	}
-	if err := nftctl.Apply(a.cfg.PublicIface, nil); err != nil {
+	if err := nftctl.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
 		return fmt.Errorf("boot empty apply: %w", err)
 	}
 	a.appliedGeneration, a.applied = 0, true
@@ -101,7 +101,7 @@ func (a *Agent) cycle(ctx context.Context) {
 	if a.applied && s.Generation == a.appliedGeneration {
 		return
 	}
-	if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s)); err != nil {
+	if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 		a.log.Error("apply failed; generation frozen", "generation", s.Generation, "error", err)
 		a.src.Report(ctx, a.appliedGeneration, err)
 		return

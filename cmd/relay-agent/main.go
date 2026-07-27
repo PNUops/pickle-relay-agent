@@ -61,7 +61,7 @@ func run(log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
-		if err := nftctl.Apply(cfg.PublicIface, nftctl.Plan(s)); err != nil {
+		if err := nftctl.Apply(cfg.PublicIface, nftctl.Plan(s), cfg.Guards); err != nil {
 			return err
 		}
 		if err := s.Persist(cfg.SnapshotPath()); err != nil {

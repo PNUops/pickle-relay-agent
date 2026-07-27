@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pnuops/pickle-relay-agent/internal/nftctl"
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
 )
 
@@ -35,19 +36,27 @@ type Config struct {
 	// sync endpoint (bootstrap/testing; the HTTP source arrives with the
 	// transport milestone).
 	SourceFile string
+	// Guards bounds each mapping's new-connection rate and concurrency — the
+	// real defense against the conntrack-exhaustion vector that shares fate
+	// with user SSH (sysctl sizing only raises the bar). Uniform across all
+	// mappings for now; per-mapping/per-source is a later milestone.
+	Guards nftctl.Guards
 }
 
 // SnapshotPath returns the persisted snapshot location.
 func (c *Config) SnapshotPath() string { return filepath.Join(c.StateDir, "snapshot.json") }
 
 const (
-	envTargetCIDR  = "PICKLE_RELAY_TARGET_CIDR"
-	envBand        = "PICKLE_RELAY_PUBLIC_BAND"
-	envPublicIface = "PICKLE_RELAY_PUBLIC_IFACE"
-	envMaxAgeH     = "PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS"
-	envPollSec     = "PICKLE_RELAY_POLL_SECONDS"
-	envSourceFile  = "PICKLE_RELAY_SOURCE_FILE"
-	envStateDir    = "STATE_DIRECTORY" // set by systemd StateDirectory=
+	envTargetCIDR   = "PICKLE_RELAY_TARGET_CIDR"
+	envBand         = "PICKLE_RELAY_PUBLIC_BAND"
+	envPublicIface  = "PICKLE_RELAY_PUBLIC_IFACE"
+	envMaxAgeH      = "PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS"
+	envPollSec      = "PICKLE_RELAY_POLL_SECONDS"
+	envSourceFile   = "PICKLE_RELAY_SOURCE_FILE"
+	envStateDir     = "STATE_DIRECTORY" // set by systemd StateDirectory=
+	envCtMax        = "PICKLE_RELAY_CT_MAX_PER_MAPPING"
+	envNewConnRate  = "PICKLE_RELAY_NEW_CONN_RATE"
+	envNewConnBurst = "PICKLE_RELAY_NEW_CONN_BURST"
 )
 
 // Load reads and validates the configuration from the environment.
@@ -110,7 +119,37 @@ func Load() (*Config, error) {
 	c.PollInterval = time.Duration(pollS) * time.Second
 
 	c.SourceFile = os.Getenv(envSourceFile)
+
+	// Abuse guards. Defaults are conservative (they only ever TIGHTEN the
+	// surface, so a default does not widen the firewall — unlike the
+	// firewall-shaping vars above) but env-overridable per relay. Set an env
+	// to 0 to disable a guard explicitly.
+	c.Guards.MaxConn, err = uint32Env(envCtMax, 512)
+	if err != nil {
+		return nil, err
+	}
+	rate, err := uint32Env(envNewConnRate, 200)
+	if err != nil {
+		return nil, err
+	}
+	c.Guards.NewConnRate = uint64(rate)
+	c.Guards.NewConnBurst, err = uint32Env(envNewConnBurst, 400)
+	if err != nil {
+		return nil, err
+	}
 	return c, nil
+}
+
+func uint32Env(key string, def uint32) (uint32, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("%s: bad unsigned integer %q", key, v)
+	}
+	return uint32(n), nil
 }
 
 func requiredHoursEnv(key string) (time.Duration, error) {

@@ -48,6 +48,18 @@ type Rule struct {
 	TargetPort uint16
 }
 
+// Guards are the per-mapping abuse limits placed AHEAD of the DNAT rule.
+// Zero fields disable the corresponding guard. Because the nat chain sees only
+// the first packet of each flow, these bound new-connection establishment —
+// exactly the conntrack-exhaustion vector that shares fate with user SSH. A
+// packet dropped at the dstnat hook leaves its conntrack entry unconfirmed, so
+// the drop does NOT consume a state-table slot.
+type Guards struct {
+	MaxConn      uint32 // `ct count over N drop` — per-mapping concurrent conns; 0 disables
+	NewConnRate  uint64 // `limit rate over R/second drop` — new-conn packets/sec; 0 disables
+	NewConnBurst uint32 // burst allowance for the rate guard
+}
+
 // Plan converts a validated snapshot into the ordered rule list.
 func Plan(s *snapshot.Snapshot) []Rule {
 	rules := make([]Rule, 0, len(s.Mappings))
@@ -65,8 +77,9 @@ func Plan(s *snapshot.Snapshot) []Rule {
 }
 
 // Apply replaces the agent's table with the planned rules in one atomic
-// netlink batch. iface is the public interface DNAT binds to.
-func Apply(iface string, rules []Rule) error {
+// netlink batch. iface is the public interface DNAT binds to; g bounds each
+// mapping's new-connection rate and concurrency.
+func Apply(iface string, rules []Rule, g Guards) error {
 	conn, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("open netlink: %w", err)
@@ -90,12 +103,8 @@ func Apply(iface string, rules []Rule) error {
 		Policy:   &accept,
 	})
 
-	for i := range rules {
-		conn.AddRule(&nftables.Rule{
-			Table: table,
-			Chain: chain,
-			Exprs: ruleExprs(iface, &rules[i]),
-		})
+	for _, exprs := range renderRules(iface, rules, g) {
+		conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: exprs})
 	}
 
 	if err := conn.Flush(); err != nil {
@@ -104,19 +113,51 @@ func Apply(iface string, rules []Rule) error {
 	return nil
 }
 
-// ruleExprs renders one rule:
+// renderRules produces the ordered per-mapping rule set (each entry is one
+// rule's expression list). Kept pure — no netlink — so the load-bearing
+// properties (guards emitted BEFORE the DNAT rule, and the 0-disables-skip
+// logic) are unit-testable without a kernel.
 //
-//	iifname <iface> <proto> dport <publicPort> counter dnat to <target>:<targetPort>
-func ruleExprs(iface string, r *Rule) []expr.Any {
+// Order within a mapping: rate guard, then connlimit guard, then DNAT.
+// Rate-first is deliberate — evaluating the connlimit expression adds the
+// packet's tuple to the kernel's conncount list as a side effect, so putting
+// the cheap token-bucket rate limit first keeps flood packets out of that list
+// entirely (a sub-rate attacker still reaches the connlimit). A guard placed
+// AFTER the DNAT rule would never run (the NAT verdict ends evaluation).
+func renderRules(iface string, rules []Rule, g Guards) [][]expr.Any {
+	out := make([][]expr.Any, 0, len(rules))
+	for i := range rules {
+		r := &rules[i]
+		if g.NewConnRate > 0 {
+			out = append(out, guardExprs(iface, r, &expr.Limit{
+				Type:  expr.LimitTypePkts,
+				Rate:  g.NewConnRate,
+				Over:  true,
+				Unit:  expr.LimitTimeSecond,
+				Burst: g.NewConnBurst,
+			}))
+		}
+		if g.MaxConn > 0 {
+			out = append(out, guardExprs(iface, r, &expr.Connlimit{Count: g.MaxConn, Flags: connlimitInv}))
+		}
+		out = append(out, dnatExprs(iface, r))
+	}
+	return out
+}
+
+// NFT_CONNLIMIT_F_INV — "over": drop when the tracked count exceeds Count.
+const connlimitInv = 1
+
+// matchExprs renders the mapping selector shared by guard and DNAT rules:
+//
+//	iifname <iface> <proto> dport <publicPort>
+func matchExprs(iface string, r *Rule) []expr.Any {
 	proto := byte(protoTCP)
 	if r.Proto == snapshot.ProtoUDP {
 		proto = protoUDP
 	}
 	pubPort := make([]byte, 2)
 	binary.BigEndian.PutUint16(pubPort, r.PublicPort)
-	dstPort := make([]byte, 2)
-	binary.BigEndian.PutUint16(dstPort, r.TargetPort)
-
 	return []expr.Any{
 		// public-interface ingress only (tunnel packets must not re-match)
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
@@ -132,6 +173,25 @@ func ruleExprs(iface string, r *Rule) []expr.Any {
 			Len:          2,
 		},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: pubPort},
+	}
+}
+
+// guardExprs = the mapping match + a limiting expression + a counter + drop.
+// The counter makes a guard's drops visible (`... over N counter drop`) — the
+// telemetry that distinguishes an attack in progress from a false positive
+// (e.g. a legitimate service whose tracked-entry count outgrew MaxConn), and
+// the natural feed for the planned heartbeat/auto-SUSPEND path.
+func guardExprs(iface string, r *Rule, limit expr.Any) []expr.Any {
+	return append(matchExprs(iface, r), limit, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
+}
+
+// dnatExprs renders the terminal rule:
+//
+//	iifname <iface> <proto> dport <publicPort> counter dnat to <target>:<targetPort>
+func dnatExprs(iface string, r *Rule) []expr.Any {
+	dstPort := make([]byte, 2)
+	binary.BigEndian.PutUint16(dstPort, r.TargetPort)
+	return append(matchExprs(iface, r),
 		// per-mapping byte/packet counter (abuse attribution: masquerade
 		// destroys client IPs, these counters are the accounting signal)
 		&expr.Counter{},
@@ -144,7 +204,7 @@ func ruleExprs(iface string, r *Rule) []expr.Any {
 			RegAddrMin:  1,
 			RegProtoMin: 2,
 		},
-	}
+	)
 }
 
 // ifname renders an interface name as the kernel's fixed 16-byte,
