@@ -74,8 +74,11 @@ func Load() (*Config, error) {
 	}
 	min64, err1 := strconv.ParseUint(strings.TrimSpace(lo), 10, 16)
 	max64, err2 := strconv.ParseUint(strings.TrimSpace(hi), 10, 16)
-	if err1 != nil || err2 != nil || min64 == 0 || min64 > max64 {
-		return nil, fmt.Errorf("%s: bad band %q", envBand, band)
+	// Floor at 1024: a band overlapping a low service port (22, 2222, ...) would
+	// let a mapping DNAT the relay's own SSH — PREROUTING DNAT shadows local
+	// delivery. Registered/dynamic ports only.
+	if err1 != nil || err2 != nil || min64 < 1024 || min64 > max64 {
+		return nil, fmt.Errorf("%s: bad band %q (min must be >= 1024)", envBand, band)
 	}
 	c.Limits.BandMin, c.Limits.BandMax = uint16(min64), uint16(max64)
 
@@ -89,7 +92,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("%s is required (run under systemd StateDirectory=)", envStateDir)
 	}
 
-	c.SnapshotMaxAge, err = hoursEnv(envMaxAgeH, 24)
+	// Required, no default: the boot re-apply window decides whether a stale
+	// DNAT may be applied — it IS firewall-shaping, so it follows the same
+	// no-in-code-default rule as the three above. Pin it to the platform's
+	// current IP quarantine window at deploy time.
+	c.SnapshotMaxAge, err = requiredHoursEnv(envMaxAgeH)
 	if err != nil {
 		return nil, err
 	}
@@ -106,10 +113,10 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
-func hoursEnv(key string, def int) (time.Duration, error) {
+func requiredHoursEnv(key string) (time.Duration, error) {
 	v := os.Getenv(key)
 	if v == "" {
-		return time.Duration(def) * time.Hour, nil
+		return 0, fmt.Errorf("%s is required (pin to the platform IP quarantine window)", key)
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n < 1 || n > 24*30 {

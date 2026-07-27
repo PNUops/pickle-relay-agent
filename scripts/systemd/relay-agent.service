@@ -3,8 +3,11 @@ Description=Pickle relay port-forwarding agent (nftables DNAT convergence)
 Documentation=https://github.com/pnuops/pickle-relay-agent
 # nftables.service loads the static plumbing table at boot; the agent only
 # ever writes its own table, but ordering keeps first-boot logs sane.
-After=network-online.target nftables.service
-Wants=network-online.target
+# time-sync.target: the bounded fail-open on the persisted snapshot trusts the
+# clock to bound staleness — order after time sync so a pre-NTP skewed clock
+# does not mis-judge a snapshot's age at boot.
+After=network-online.target nftables.service time-sync.target
+Wants=network-online.target time-sync.target
 
 [Service]
 Type=simple
@@ -34,7 +37,9 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+RemoveIPC=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible

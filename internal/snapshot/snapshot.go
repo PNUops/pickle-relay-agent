@@ -107,11 +107,21 @@ func (s *Snapshot) Validate(lim Limits) error {
 
 // Parse decodes and validates a snapshot from JSON bytes.
 func Parse(data []byte, lim Limits) (*Snapshot, error) {
+	// A bare `null` (or a truncated write) decodes to a zero-value Snapshot
+	// without error — generation 0, no mappings — which would silently flush
+	// every rule. Reject it outright; an empty desired set must be the
+	// explicit `{"generation":N,"mappings":[]}` form.
+	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
+		return nil, errors.New("snapshot body is null")
+	}
 	var s Snapshot
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("decode snapshot: %w", err)
+	}
+	if dec.More() {
+		return nil, errors.New("trailing data after snapshot JSON")
 	}
 	if err := s.Validate(lim); err != nil {
 		return nil, err
@@ -171,9 +181,23 @@ func LoadPersisted(path string, lim Limits, maxAge time.Duration, now time.Time)
 	if s.PersistedAt.IsZero() {
 		return nil, errors.New("persisted snapshot missing persistedAt")
 	}
+	// A future persistedAt would make now.Sub(persistedAt) negative and pass the
+	// age check no matter how old the snapshot really is. Boot — before NTP
+	// sync — is exactly when the clock is least trustworthy, so an impossible
+	// (future) timestamp means the clock cannot be trusted to bound staleness:
+	// fail closed rather than risk re-applying a beyond-quarantine snapshot
+	// whose target IP may have been re-assigned to another tenant.
+	if s.PersistedAt.After(now.Add(clockSkewTolerance)) {
+		return nil, fmt.Errorf("persisted snapshot timestamp %s is in the future (clock untrusted)",
+			s.PersistedAt.Format(time.RFC3339))
+	}
 	if now.Sub(s.PersistedAt) > maxAge {
 		return nil, fmt.Errorf("%w (persisted %s, max age %s)", ErrStale,
 			s.PersistedAt.Format(time.RFC3339), maxAge)
 	}
 	return s, nil
 }
+
+// clockSkewTolerance is the small grace allowed on a persisted timestamp before
+// it is treated as impossible-future (and therefore clock-untrusted).
+const clockSkewTolerance = 5 * time.Minute

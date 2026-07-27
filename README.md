@@ -41,8 +41,9 @@ sync 응답 본문 = `apply` 입력 파일 = 보존 파일(+`persistedAt`). 예�
       "targetAddr": "192.0.2.23", "targetPort": 8080 } ] }
 ```
 
-- `proto`: `tcp` | `udp` · `publicPort`: 릴레이 예약 대역 내 · `targetAddr`: 화이트리스트
-  CIDR 내 IPv4 · 동일 (proto, publicPort) 중복 금지.
+- `proto`: `tcp` | `udp` · `publicPort`: 릴레이 예약 대역 내(대역 하한 1024 — 저포트를
+  DNAT으로 가리지 않도록) · `targetAddr`: 화이트리스트 CIDR 내 IPv4 · 동일 (proto,
+  publicPort) 중복 금지.
 - 정지(SUSPEND)된 매핑은 스냅샷에서 제외되어 내려온다 — 에이전트는 원하는 상태만 안다.
 
 ## 실행 모드
@@ -65,7 +66,7 @@ relay-agent run                         # 부팅 재적용 → 폴링 루프
 | `PICKLE_RELAY_PUBLIC_BAND` | ✔ | 공인 포트 대역 `MIN-MAX` |
 | `PICKLE_RELAY_PUBLIC_IFACE` | ✔ | DNAT을 걸 공인 인터페이스 이름 |
 | `STATE_DIRECTORY` | ✔ | 보존 스냅샷 위치 (systemd `StateDirectory=`가 주입) |
-| `PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS` | | 부팅 재적용 허용 창 (기본 24) |
+| `PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS` | ✔ | 부팅 재적용 허용 창 — 플랫폼 IP 격리 창에 고정(방화벽 형성 값이라 기본값 없음) |
 | `PICKLE_RELAY_POLL_SECONDS` | | 폴링 주기 (기본 15, 5–300) |
 | `PICKLE_RELAY_SOURCE_FILE` | | 파일 소스 경로 (전송부 도입 전 필수) |
 

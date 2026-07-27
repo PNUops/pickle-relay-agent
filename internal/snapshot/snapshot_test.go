@@ -91,6 +91,29 @@ func TestPersistRoundTripAndAgeBound(t *testing.T) {
 	if !errors.Is(err, ErrStale) {
 		t.Fatalf("want ErrStale, got %v", err)
 	}
+
+	// future persistedAt (clock behind at boot): must fail closed, NOT pass as
+	// fresh on a negative age.
+	_, err = LoadPersisted(path, testLimits(), 24*time.Hour, time.Now().Add(-time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "future") {
+		t.Fatalf("want future-timestamp rejection, got %v", err)
+	}
+}
+
+func TestParseRejectsNullAndTrailing(t *testing.T) {
+	for name, js := range map[string]string{
+		"null body":     "null",
+		"null spaced":   "  null\n",
+		"trailing data": `{"generation":1,"mappings":[]}{"x":1}`,
+	} {
+		if _, err := Parse([]byte(js), testLimits()); err == nil {
+			t.Errorf("%s: accepted, want error", name)
+		}
+	}
+	// an explicit empty set stays valid
+	if _, err := Parse([]byte(`{"generation":9,"mappings":[]}`), testLimits()); err != nil {
+		t.Fatalf("explicit empty set rejected: %v", err)
+	}
 }
 
 func TestLoadPersistedRevalidates(t *testing.T) {
