@@ -1,0 +1,11 @@
+# Build output
+/relay-agent
+/dist/
+
+# Go
+*.test
+*.out
+coverage.txt
+
+# Local runtime state (never committed)
+snapshot.json
