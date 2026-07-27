@@ -68,9 +68,26 @@ relay-agent run                         # 부팅 재적용 → 폴링 루프
 | `STATE_DIRECTORY` | ✔ | 보존 스냅샷 위치 (systemd `StateDirectory=`가 주입) |
 | `PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS` | ✔ | 부팅 재적용 허용 창 — 플랫폼 IP 격리 창에 고정(방화벽 형성 값이라 기본값 없음) |
 | `PICKLE_RELAY_POLL_SECONDS` | | 폴링 주기 (기본 15, 5–300) |
+| `PICKLE_RELAY_CT_MAX_PER_MAPPING` | | 매핑당 동시 연결 상한 `ct count over N drop` (기본 512, `0`=비활성) |
+| `PICKLE_RELAY_NEW_CONN_RATE` | | 매핑당 신규 연결 pps 상한 `limit rate over R/second` (기본 200, `0`=비활성) |
+| `PICKLE_RELAY_NEW_CONN_BURST` | | 위 rate의 버스트 허용치 (기본 400) |
 | `PICKLE_RELAY_SOURCE_FILE` | | 파일 소스 경로 (전송부 도입 전 필수) |
 
 배포 값은 `/etc/pickle/relay-agent.env`(root 소유 640)에 둔다 — 저장소에는 없다.
+
+가드 3종은 **조이는 방향(drop 상한)만** 하므로 기본값이 방화벽을 넓히지 않는다 — 그래서
+위 필수 4종과 달리 기본값이 허용된다. **값 선정은 코드보다 중요한 운영 결정**이다.
+
+- `ct count`는 **살아있는 연결이 아니라 conntrack 엔트리 수**를 센다(TIME_WAIT 포함). 따라서
+  매핑당 정상 지속 한도 ≈ `ct 상한 ÷ TCP TIME_WAIT 수명`이다. 릴레이는 TIME_WAIT를 30s로
+  낮춰(순수 NAT 포워더) 512 상한에서 매핑당 약 17 conn/s를 견디며, 버스트는 rate 가드의 버스트
+  허용치가 흡수한다. 짧은 연결이 잦은 서비스(keep-alive 없는 HTTP 등)를 매핑에 얹으면 이 한도를
+  기준으로 값을 올려야 한다.
+- 가드 규칙에는 counter가 붙어(`… over N counter drop`) 드롭이 관측된다 — 정상 트래픽 오탐과
+  실제 공격을 구분하는 신호이자 향후 heartbeat/자동 SUSPEND의 입력이다.
+- 기본값은 **전역 conntrack 포화로 사용자 SSH가 막히는 것을 방지**하도록 잡았다. 실측: 가드 없이
+  대량 UDP 플러드가 상태 테이블을 채워 :22 신규 접속을 차단했으나, 가드 활성 시 동일 플러드에도
+  매핑 conntrack 발자국이 버스트 수준으로 유계·SSH 무영향.
 
 ## 구성 요소·버전
 
