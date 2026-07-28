@@ -67,6 +67,9 @@ func run(log *slog.Logger) error {
 		if err := s.Persist(cfg.SnapshotPath()); err != nil {
 			return fmt.Errorf("applied, but persist failed: %w", err)
 		}
+		// The "applied" message and its INFO level are a stable surface:
+		// operational tooling matches success-path log lines by message name.
+		// Do not rename or demote without coordinating that tooling.
 		log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
 		return nil
 

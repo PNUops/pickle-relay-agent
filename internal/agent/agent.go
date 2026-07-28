@@ -86,6 +86,10 @@ func (a *Agent) BootReapply() error {
 			return fmt.Errorf("boot re-apply: %w", err)
 		}
 		a.appliedGeneration, a.applied = s.Generation, true
+		// "boot re-apply" and "no persisted snapshot" below are stable
+		// message names at INFO: operational tooling matches these
+		// success-path lines. Do not rename or demote them without
+		// coordinating that tooling.
 		a.log.Info("boot re-apply", "generation", s.Generation, "mappings", len(s.Mappings))
 		return nil
 	case errors.Is(err, os.ErrNotExist):
@@ -195,6 +199,9 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		keep[s.Mappings[i].ID] = struct{}{}
 	}
 	a.counters.Prune(keep)
+	// "applied" is a stable message name at INFO: operational tooling
+	// matches this success-path line. Do not rename or demote it without
+	// coordinating that tooling.
 	a.log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
 	return advanced
 }
