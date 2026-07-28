@@ -52,6 +52,7 @@ func TestParseRejects(t *testing.T) {
 		"ipv6 target":       `{"generation":1,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"2001:db8::1","targetPort":1}]}`,
 		"outside whitelist": `{"generation":1,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"198.51.100.9","targetPort":1}]}`,
 		"duplicate":         `{"generation":1,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1},{"id":2,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.2","targetPort":2}]}`,
+		"gen 0 non-empty":   `{"generation":0,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1}]}`,
 	}
 	for name, js := range cases {
 		if _, err := Parse([]byte(js), testLimits()); err == nil {

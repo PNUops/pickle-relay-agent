@@ -8,6 +8,10 @@ Documentation=https://github.com/pnuops/pickle-relay-agent
 # does not mis-judge a snapshot's age at boot.
 After=network-online.target nftables.service time-sync.target
 Wants=network-online.target time-sync.target
+# If nftables is restarted (e.g. a package upgrade), the agent restarts with it
+# and re-applies the mapping table via BootReapply — so a flush cannot leave the
+# port-forwarding path down until the next mapping change.
+PartOf=nftables.service
 
 [Service]
 Type=simple

@@ -89,6 +89,8 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		"band garbage":                        {"PICKLE_RELAY_PUBLIC_BAND", "many"},
 		"band zero":                           {"PICKLE_RELAY_PUBLIC_BAND", "0-100"},
 		"band below floor (would shadow SSH)": {"PICKLE_RELAY_PUBLIC_BAND", "22-19999"},
+		"band includes admin sshd 2222":       {"PICKLE_RELAY_PUBLIC_BAND", "2000-19999"},
+		"band includes wireguard 51820":       {"PICKLE_RELAY_PUBLIC_BAND", "50000-59999"},
 		"iface long":                          {"PICKLE_RELAY_PUBLIC_IFACE", "waaaaaaaaaaaaaaaaytoolong"},
 		"poll low":                            {"PICKLE_RELAY_POLL_SECONDS", "1"},
 		"age zero":                            {"PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS", "0"},

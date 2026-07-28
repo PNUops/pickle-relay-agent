@@ -68,6 +68,13 @@ func (s *Snapshot) Validate(lim Limits) error {
 	if s.Generation < 0 {
 		return fmt.Errorf("negative generation %d", s.Generation)
 	}
+	// Generation 0 is reserved for the empty/uninitialized set (the boot
+	// converge-to-empty leaves appliedGeneration=0). A non-empty snapshot at
+	// generation 0 would be silently skipped by the unchanged-generation
+	// short-circuit — reject it so generations for real mappings start at 1.
+	if s.Generation == 0 && len(s.Mappings) > 0 {
+		return errors.New("generation 0 with non-empty mappings (real generations start at 1)")
+	}
 	if len(s.Mappings) > MaxMappings {
 		return fmt.Errorf("%d mappings exceeds cap %d", len(s.Mappings), MaxMappings)
 	}

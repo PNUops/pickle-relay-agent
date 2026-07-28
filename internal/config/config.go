@@ -46,6 +46,11 @@ type Config struct {
 // SnapshotPath returns the persisted snapshot location.
 func (c *Config) SnapshotPath() string { return filepath.Join(c.StateDir, "snapshot.json") }
 
+// reservedRelayPorts are the relay's own service ports that a DNAT mapping
+// must never be allowed to shadow (admin sshd, WireGuard). SSH :22 is below the
+// 1024 floor already; these are the >=1024 cases the floor misses.
+var reservedRelayPorts = []uint16{2222, 51820}
+
 const (
 	envTargetCIDR   = "PICKLE_RELAY_TARGET_CIDR"
 	envBand         = "PICKLE_RELAY_PUBLIC_BAND"
@@ -83,11 +88,18 @@ func Load() (*Config, error) {
 	}
 	min64, err1 := strconv.ParseUint(strings.TrimSpace(lo), 10, 16)
 	max64, err2 := strconv.ParseUint(strings.TrimSpace(hi), 10, 16)
-	// Floor at 1024: a band overlapping a low service port (22, 2222, ...) would
-	// let a mapping DNAT the relay's own SSH — PREROUTING DNAT shadows local
-	// delivery. Registered/dynamic ports only.
+	// Floor at 1024: keep the band in registered/dynamic port space.
 	if err1 != nil || err2 != nil || min64 < 1024 || min64 > max64 {
 		return nil, fmt.Errorf("%s: bad band %q (min must be >= 1024)", envBand, band)
+	}
+	// A band that spans a relay service port would let a mapping DNAT it away —
+	// PREROUTING DNAT shadows local delivery, so a mapping on the relay's own
+	// admin sshd (2222) or WireGuard (51820) would lock the box out or kill the
+	// tunnel. The floor alone does not catch these (both are >= 1024).
+	for _, p := range reservedRelayPorts {
+		if uint16(min64) <= p && p <= uint16(max64) {
+			return nil, fmt.Errorf("%s: band %q includes reserved relay port %d", envBand, band, p)
+		}
 	}
 	c.Limits.BandMin, c.Limits.BandMax = uint16(min64), uint16(max64)
 

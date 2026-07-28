@@ -99,7 +99,17 @@ func (a *Agent) cycle(ctx context.Context) {
 		return
 	}
 	if a.applied && s.Generation == a.appliedGeneration {
-		return
+		// Generation unchanged — normally a no-op, but re-assert if the kernel
+		// table was wiped out of band (e.g. an `nft flush ruleset` or an
+		// nftables restart without the ExecStop drop-in): otherwise the
+		// mappings would stay gone until the next mapping change.
+		if present, perr := nftctl.Present(); perr == nil && present {
+			return
+		} else if perr != nil {
+			a.log.Warn("table presence check failed; re-applying", "error", perr)
+		} else {
+			a.log.Warn("kernel table missing at unchanged generation; re-applying", "generation", s.Generation)
+		}
 	}
 	if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 		a.log.Error("apply failed; generation frozen", "generation", s.Generation, "error", err)

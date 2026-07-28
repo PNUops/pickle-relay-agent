@@ -76,6 +76,27 @@ func Plan(s *snapshot.Snapshot) []Rule {
 	return rules
 }
 
+// Present reports whether the agent's own table currently exists in the
+// kernel. Used to detect an out-of-band wipe (e.g. someone ran
+// `nft flush ruleset` or restarted nftables without the ExecStop drop-in) so
+// the agent can re-assert even when the desired generation is unchanged.
+func Present() (bool, error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return false, fmt.Errorf("open netlink: %w", err)
+	}
+	tables, err := conn.ListTablesOfFamily(nftables.TableFamilyIPv4)
+	if err != nil {
+		return false, fmt.Errorf("list tables: %w", err)
+	}
+	for _, t := range tables {
+		if t.Name == TableName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // Apply replaces the agent's table with the planned rules in one atomic
 // netlink batch. iface is the public interface DNAT binds to; g bounds each
 // mapping's new-connection rate and concurrency.
@@ -192,8 +213,10 @@ func dnatExprs(iface string, r *Rule) []expr.Any {
 	dstPort := make([]byte, 2)
 	binary.BigEndian.PutUint16(dstPort, r.TargetPort)
 	return append(matchExprs(iface, r),
-		// per-mapping byte/packet counter (abuse attribution: masquerade
-		// destroys client IPs, these counters are the accounting signal)
+		// per-mapping counter. NOTE: this rule is in a nat chain, so it counts
+		// each flow's FIRST packet only — a new-connection counter, NOT a byte
+		// meter (its byte total reads ~0 regardless of volume). Byte-rate abuse
+		// attribution needs a forward-chain counter; see port-forwarding.md.
 		&expr.Counter{},
 		// dnat to target:port
 		&expr.Immediate{Register: 1, Data: r.Target[:]},
