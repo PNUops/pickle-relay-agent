@@ -15,6 +15,7 @@ import (
 	"github.com/pnuops/pickle-relay-agent/internal/nftctl"
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
 	"github.com/pnuops/pickle-relay-agent/internal/source"
+	"github.com/pnuops/pickle-relay-agent/internal/version"
 )
 
 // Agent converges nftables to the desired mapping set.
@@ -28,6 +29,11 @@ type Agent struct {
 	// rule: reality and the reported generation must not diverge.
 	appliedGeneration int64
 	applied           bool
+
+	// lastErr is what the next sync report carries in lastError: why the
+	// latest snapshot was rejected or failed to apply. Retained across
+	// cycles until an apply succeeds.
+	lastErr []source.ErrItem
 }
 
 // New builds an agent.
@@ -82,9 +88,15 @@ func (a *Agent) Run(ctx context.Context) error {
 }
 
 func (a *Agent) cycle(ctx context.Context) {
-	body, changed, err := a.src.Fetch(ctx, a.appliedGeneration)
+	rep := source.Report{
+		AppliedGeneration: a.appliedGeneration,
+		AgentVersion:      version.Version,
+		LastError:         a.lastErr,
+	}
+	body, changed, err := a.src.Sync(ctx, rep)
 	if err != nil {
-		a.log.Warn("fetch failed", "error", err)
+		// the POST itself was the report; nothing else to do until next tick
+		a.log.Warn("sync failed", "error", err)
 		return
 	}
 	if !changed {
@@ -93,9 +105,10 @@ func (a *Agent) cycle(ctx context.Context) {
 	s, err := snapshot.Parse(body, a.cfg.Limits)
 	if err != nil {
 		// a snapshot that fails validation is NOT applied and does not
-		// advance the generation — report and keep the last good rule set
+		// advance the generation — the next report carries the error and
+		// the last good rule set stays
 		a.log.Error("snapshot rejected", "error", err)
-		a.src.Report(ctx, a.appliedGeneration, err)
+		a.setLastErr(err)
 		return
 	}
 	if a.applied && s.Generation == a.appliedGeneration {
@@ -113,13 +126,26 @@ func (a *Agent) cycle(ctx context.Context) {
 	}
 	if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 		a.log.Error("apply failed; generation frozen", "generation", s.Generation, "error", err)
-		a.src.Report(ctx, a.appliedGeneration, err)
+		a.setLastErr(err)
 		return
 	}
 	if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
 		a.log.Warn("persist failed (kernel state is applied)", "error", err)
 	}
 	a.appliedGeneration, a.applied = s.Generation, true
+	a.lastErr = nil
 	a.log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
-	a.src.Report(ctx, a.appliedGeneration, nil)
+}
+
+// setLastErr shapes err into the next report's error items. A per-mapping
+// validation failure carries its mapping id (snapshot.ValidationError);
+// anything else becomes one unattributed item.
+func (a *Agent) setLastErr(err error) {
+	item := source.ErrItem{Message: err.Error()}
+	var ve *snapshot.ValidationError
+	if errors.As(err, &ve) {
+		id := ve.MappingID
+		item.MappingID = &id
+	}
+	a.lastErr = []source.ErrItem{item}
 }
