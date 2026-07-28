@@ -32,6 +32,18 @@ type Mapping struct {
 	TargetAddr string `json:"targetAddr"`
 	TargetPort uint16 `json:"targetPort"`
 
+	// Per-mapping guard overrides. nil (field omitted or null) keeps the
+	// agent's env default; an explicit 0 disables that guard for this
+	// mapping; any other value replaces the default. Overrides come from the
+	// authenticated desired-state authority, so widening — including
+	// disabling — is legitimate here: the tighten-only rule constrains the
+	// agent-side DEFAULTS only (a default must never widen the surface).
+	CtMax          *uint32 `json:"ctMax,omitempty"`
+	NewConnRate    *uint64 `json:"newConnRate,omitempty"`
+	NewConnBurst   *uint32 `json:"newConnBurst,omitempty"`
+	PerSourceRate  *uint64 `json:"perSourceRate,omitempty"`
+	PerSourceBurst *uint32 `json:"perSourceBurst,omitempty"`
+
 	// target is the validated form of TargetAddr, set by Validate.
 	target netip.Addr
 }
@@ -62,6 +74,22 @@ type Limits struct {
 // natural ceiling (one mapping per proto+port).
 const MaxMappings = 65536
 
+// ValidationError marks a validation failure attributable to one mapping, so
+// callers can surface WHICH mapping was rejected (the sync report's error
+// items carry a mappingId). Retrieve with errors.As.
+type ValidationError struct {
+	MappingID int64
+	Err       error
+}
+
+func (e *ValidationError) Error() string { return fmt.Sprintf("mapping %d: %v", e.MappingID, e.Err) }
+func (e *ValidationError) Unwrap() error { return e.Err }
+
+// mappingErr wraps a per-mapping validation failure.
+func mappingErr(id int64, format string, args ...any) error {
+	return &ValidationError{MappingID: id, Err: fmt.Errorf(format, args...)}
+}
+
 // Validate checks every mapping against the limits and rejects duplicates.
 // It mutates the receiver (fills the parsed target addresses).
 func (s *Snapshot) Validate(lim Limits) error {
@@ -82,29 +110,38 @@ func (s *Snapshot) Validate(lim Limits) error {
 	for i := range s.Mappings {
 		m := &s.Mappings[i]
 		if m.Proto != ProtoTCP && m.Proto != ProtoUDP {
-			return fmt.Errorf("mapping %d: unknown proto %q", m.ID, m.Proto)
+			return mappingErr(m.ID, "unknown proto %q", m.Proto)
 		}
 		if m.PublicPort < lim.BandMin || m.PublicPort > lim.BandMax {
-			return fmt.Errorf("mapping %d: public port %d outside band %d-%d",
-				m.ID, m.PublicPort, lim.BandMin, lim.BandMax)
+			return mappingErr(m.ID, "public port %d outside band %d-%d",
+				m.PublicPort, lim.BandMin, lim.BandMax)
 		}
 		if m.TargetPort == 0 {
-			return fmt.Errorf("mapping %d: target port 0", m.ID)
+			return mappingErr(m.ID, "target port 0")
 		}
 		addr, err := netip.ParseAddr(m.TargetAddr)
 		if err != nil {
-			return fmt.Errorf("mapping %d: bad target address: %v", m.ID, err)
+			return mappingErr(m.ID, "bad target address: %v", err)
 		}
 		if !addr.Is4() {
-			return fmt.Errorf("mapping %d: target %s is not IPv4", m.ID, addr)
+			return mappingErr(m.ID, "target %s is not IPv4", addr)
 		}
 		if !lim.TargetCIDR.Contains(addr) {
-			return fmt.Errorf("mapping %d: target %s outside allowed %s",
-				m.ID, addr, lim.TargetCIDR)
+			return mappingErr(m.ID, "target %s outside allowed %s", addr, lim.TargetCIDR)
+		}
+		// A burst is meaningless without its rate: the guard is a token
+		// bucket, so a burst override with the rate absent or explicitly
+		// disabled (0) can only be a caller mistake — reject rather than
+		// guess which limit was intended.
+		if m.NewConnBurst != nil && (m.NewConnRate == nil || *m.NewConnRate == 0) {
+			return mappingErr(m.ID, "newConnBurst requires a non-zero newConnRate")
+		}
+		if m.PerSourceBurst != nil && (m.PerSourceRate == nil || *m.PerSourceRate == 0) {
+			return mappingErr(m.ID, "perSourceBurst requires a non-zero perSourceRate")
 		}
 		key := [2]any{m.Proto, m.PublicPort}
 		if _, dup := seen[key]; dup {
-			return fmt.Errorf("mapping %d: duplicate %s public port %d", m.ID, m.Proto, m.PublicPort)
+			return mappingErr(m.ID, "duplicate %s public port %d", m.Proto, m.PublicPort)
 		}
 		seen[key] = struct{}{}
 		m.target = addr

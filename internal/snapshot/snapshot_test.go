@@ -147,3 +147,82 @@ func TestPersistMissingPersistedAt(t *testing.T) {
 		t.Fatal("accepted snapshot without persistedAt")
 	}
 }
+
+func TestGuardOverrideRoundTrip(t *testing.T) {
+	// omitted → nil, explicit 0 → disabled, value → override; and the
+	// persisted copy must carry the overrides byte-identically through a
+	// Persist/LoadPersisted round trip.
+	js := `{
+	  "generation": 3,
+	  "mappings": [
+	    {"id": 5, "proto": "tcp", "publicPort": 10443, "targetAddr": "192.0.2.40", "targetPort": 443,
+	     "ctMax": 0, "newConnRate": 1000, "newConnBurst": 2000, "perSourceRate": 80, "perSourceBurst": 160},
+	    {"id": 6, "proto": "udp", "publicPort": 10514, "targetAddr": "192.0.2.41", "targetPort": 514}
+	  ]}`
+	check := func(s *Snapshot) {
+		t.Helper()
+		m := s.Mappings[0]
+		if m.CtMax == nil || *m.CtMax != 0 {
+			t.Fatalf("ctMax = %v, want explicit 0", m.CtMax)
+		}
+		if m.NewConnRate == nil || *m.NewConnRate != 1000 || m.NewConnBurst == nil || *m.NewConnBurst != 2000 {
+			t.Fatalf("newConn override = %v/%v, want 1000/2000", m.NewConnRate, m.NewConnBurst)
+		}
+		if m.PerSourceRate == nil || *m.PerSourceRate != 80 || m.PerSourceBurst == nil || *m.PerSourceBurst != 160 {
+			t.Fatalf("perSource override = %v/%v, want 80/160", m.PerSourceRate, m.PerSourceBurst)
+		}
+		n := s.Mappings[1]
+		if n.CtMax != nil || n.NewConnRate != nil || n.NewConnBurst != nil || n.PerSourceRate != nil || n.PerSourceBurst != nil {
+			t.Fatalf("omitted overrides must stay nil: %+v", n)
+		}
+	}
+	s, err := Parse([]byte(js), testLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(s)
+
+	path := filepath.Join(t.TempDir(), "snapshot.json")
+	if err := s.Persist(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadPersisted(path, testLimits(), 24*time.Hour, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(got)
+}
+
+func TestGuardOverrideRejects(t *testing.T) {
+	head := `{"generation":1,"mappings":[{"id":9,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1,`
+	for name, tail := range map[string]string{
+		"burst without rate":            `"newConnBurst":100}]}`,
+		"burst with disabled rate":      `"newConnRate":0,"newConnBurst":100}]}`,
+		"per-source burst without rate": `"perSourceBurst":100}]}`,
+		"per-source burst zero rate":    `"perSourceRate":0,"perSourceBurst":100}]}`,
+		"unknown guard field":           `"ctMaximum":1}]}`,
+	} {
+		if _, err := Parse([]byte(head+tail), testLimits()); err == nil {
+			t.Errorf("%s: accepted, want error", name)
+		}
+	}
+	// rate alone (no burst) stays valid, both families
+	ok := head + `"newConnRate":500,"perSourceRate":25}]}`
+	if _, err := Parse([]byte(ok), testLimits()); err != nil {
+		t.Fatalf("rate-only override rejected: %v", err)
+	}
+}
+
+func TestValidationErrorCarriesMappingID(t *testing.T) {
+	js := `{"generation":1,"mappings":[
+	  {"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1},
+	  {"id":77,"proto":"tcp","publicPort":10001,"targetAddr":"198.51.100.9","targetPort":1}]}`
+	_, err := Parse([]byte(js), testLimits())
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("want ValidationError, got %v", err)
+	}
+	if ve.MappingID != 77 {
+		t.Fatalf("mapping id = %d, want 77", ve.MappingID)
+	}
+}
