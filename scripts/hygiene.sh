@@ -19,7 +19,7 @@
 # the first scrub missed most of its targets. `network.md` is deliberately absent:
 # the infra repo has a runbook of the same name and the collision would make the
 # gate unusable there.
-HYGIENE_DOC_NAMES='internal\.md|permission-matrix\.md|hosts\.md|credentials\.md|domains-tls\.md|scheduled-jobs\.md|product-spec\.md|status\.md|architecture\.md|roadmap\.md|glossary\.md|commit-convention\.md|dev-setup\.md|production-gates\.md|backlog\.md|console-views\.md|ssh-access\.md|out-of-scope\.md|findings-triage\.md|data-model\.md|network-ipam\.md|ports\.md|security\.md|provisioning\.md|environments-deploy\.md|verification-gaps\.md'
+HYGIENE_DOC_NAMES='internal\.md|permission-matrix\.md|hosts\.md|credentials\.md|domains-tls\.md|scheduled-jobs\.md|product-spec\.md|status\.md|architecture\.md|roadmap\.md|glossary\.md|commit-message\.md|readme-style\.md|dev-setup\.md|production-gates\.md|backlog\.md|console-views\.md|ssh-access\.md|out-of-scope\.md|findings-triage\.md|data-model\.md|network-ipam\.md|ports\.md|security\.md|provisioning\.md|environments-deploy\.md|verification-gaps\.md'
 
 # The private repo and the secret vault, by path and by the names of the scripts
 # that live there.

@@ -1,31 +1,43 @@
 # pickle-relay-agent
 
-부산대학교 클라우드 플랫폼(Pickle)의 포트포워딩 릴레이에서 nftables DNAT을 제어하는
+부산대학교 클라우드 플랫폼(Pickle)의 오프캠퍼스 릴레이에서 nftables DNAT을 제어하는
 에이전트입니다.
 
-플랫폼이 정의한 "원하는 매핑 집합"(공인 포트 → VM 포트)을 받아, 오프캠퍼스 릴레이
-호스트의 방화벽을 그 상태로 수렴시킵니다. 왼쪽에서 스냅샷이 들어와 오른쪽 커널 규칙이
-됩니다.
+캠퍼스 방화벽이 인바운드를 막기 때문에, 사용자 포트는 오프캠퍼스 릴레이 호스트가 대신
+받아 캠퍼스가 아웃바운드로 개통한 WireGuard 터널로 VM까지 넘깁니다. 이 에이전트는 그
+릴레이 호스트에서 돌아갑니다.
 
 ```
-플랫폼 API ── 매핑 스냅샷(JSON, generation 태그) ──▶ relay-agent ──▶ nftables (netlink)
+인터넷 ──공인 포트──▶ 릴레이 호스트 nftables DNAT ──WireGuard──▶ 캠퍼스 ──▶ 사용자 VM
+                            ▲ netlink
+                       relay-agent ── 매핑 스냅샷(JSON, generation) 조회 ──▶ 플랫폼 API
 ```
 
-에이전트는 스냅샷을 만들지 않고 받기만 합니다. 무엇을 열지는 플랫폼이 정합니다.
+에이전트는 스냅샷을 만들지 않고 가져오기만 합니다. 무엇을 열지는 플랫폼이 정합니다.
 
 현재는 `PICKLE_RELAY_SOURCE_FILE`이 가리키는 로컬 파일을 폴링합니다. HTTP 동기화는 아직
 제공하지 않습니다.
 
-## 지향하는 바
+## 주요 기능
 
-- 호스트의 다른 방화벽 설정을 침범하지 않는 범위를 유지합니다.
-- 절반만 적용된 상태가 생기지 않도록 고민합니다.
-- 들어오는 값을 방화벽 설정으로 취급해 매번 다시 검증합니다.
-- 자식 프로세스 없이 도는 상태를 유지해 systemd 하드닝을 최대로 켭니다.
+플랫폼은 VM 신청·승인·생성, SSH와 웹 터미널 접속, 도메인 공개, 만료와
+삭제까지를 다룹니다. 이 저장소가 맡는 부분은 아래와 같습니다.
+
+- **매핑 수렴**: 플랫폼이 정한 공인 포트에서 VM 포트로 가는 매핑을 릴레이 호스트의
+  방화벽에 반영합니다.
+- **원자 교체**: 적용할 때마다 자기 규칙 전체를 한 번에 바꾸므로 절반만 반영된 상태가
+  생기지 않습니다.
+- **남용 가드**: 매핑마다 동시 연결 수와 신규 연결 속도에 상한을 두어, 한 매핑에 몰린
+  트래픽이 다른 접속 경로를 밀어내지 못하게 합니다.
+- **입력 재검증**: 받은 스냅샷을 그대로 믿지 않고 대상 대역과 공인 대역, 중복 여부를
+  매번 다시 확인합니다.
+- **오래된 상태 폐기**: 보존한 스냅샷이 허용 창을 넘기면 버리고 빈 집합으로 수렴합니다.
+- **차단 집계**: 가드 규칙이 무엇을 얼마나 막았는지 counter로 기록합니다.
+- **부팅 복구**: 릴레이가 재시작해도 마지막 상태를 다시 적용해 매핑이 살아납니다.
 
 ## 동작 방식
 
-- **자기 테이블만 소유합니다.** `ip pickle_relay_dnat` 하나만 만들고 교체합니다. 룰셋
+- **소유 범위** — `ip pickle_relay_dnat` 하나만 만들고 교체합니다. 룰셋
   전체 flush는 코드에 없습니다. 정적 배관 테이블은 호스트 부팅 설정이 소유합니다.
 - **적용은 원자적입니다.** 테이블 삭제, 재생성, 전체 규칙을 단일 netlink 배치로
   커밋합니다. 이전 규칙 전체이거나 새 규칙 전체이거나 둘 중 하나입니다.
@@ -33,19 +45,19 @@
 - **입력을 매번 검증합니다.** 모든 값을 타입 파싱(`netip.Addr`, 포트 정수)하고 대상
   CIDR 화이트리스트, 공인 포트 대역, 중복 여부를 매 로드마다 다시 확인합니다.
 - **fail-open에 경계가 있습니다.** 마지막 적용 스냅샷을 보존해 두고 부팅 때
-  재적용하는데, 나이가 허용 창(현재 24h, 플랫폼의 IP 격리 창과 같은 값)을 넘겼으면
-  폐기하고 빈 집합으로 수렴합니다. 회수된 IP가 그 사이 다른 사용자에게 재할당됐을 수
-  있기 때문입니다.
-- **netlink를 직접 씁니다.** `nft(8)`를 실행하지 않아 자식 프로세스가 없고, systemd
+  재적용합니다. 나이가 허용 창을 넘겼으면 폐기하고 빈 집합으로 수렴합니다. 회수된 IP가
+  그 사이 다른 사용자에게 재할당됐을 수 있기 때문입니다. 허용 창은 플랫폼의 IP 격리
+  창과 같은 값으로 둡니다.
+- **netlink 직접 호출** — `nft(8)`를 실행하지 않아 자식 프로세스가 없고, systemd
   유닛이 `SystemCallFilter=@system-service`와 `MemoryDenyWriteExecute=yes`를 켠 채
-  돕니다. exec 헬퍼를 추가한다면 이 하드닝 블록부터 다시 봐야 합니다.
+  돌아갑니다. exec 헬퍼를 추가한다면 이 하드닝 블록부터 다시 봐야 합니다.
 - **방화벽을 결정하는 값에는 기본값이 없습니다.** 대상 CIDR, 공인 대역, 인터페이스,
   스냅샷 허용 창은 없으면 기동을 거부합니다.
 
 ## 스냅샷 형식
 
 sync 응답 본문, `apply` 입력 파일, 보존 파일이 모두 같은 형태입니다. 예시는 문서화
-대역(RFC 5737) 주소를 씁니다.
+대역(RFC 5737) 주소를 사용합니다.
 
 ```json
 { "generation": 42,
@@ -59,26 +71,40 @@ sync 응답 본문, `apply` 입력 파일, 보존 파일이 모두 같은 형태
 (proto, publicPort) 중복은 허용하지 않습니다. 정지된 매핑은 스냅샷에서 빠진 채로
 내려옵니다.
 
-## 실행 모드
+## 남용 가드
+
+매핑마다 `ct count`(동시 연결 상한)와 신규 연결 rate limit, 그 버스트 허용치가 붙습니다.
+가드 셋 모두 조이는 방향(drop 상한)만 있어 기본값이 방화벽을 넓히지 않습니다.
+
+`ct count`가 세는 것은 살아 있는 연결이 아니라 conntrack 엔트리 수이고 TIME_WAIT도
+포함합니다. 그래서 매핑당 정상 지속 한도는 대략 `상한 ÷ TIME_WAIT 수명`입니다. 릴레이는
+순수 NAT 포워더라 TIME_WAIT를 30초로 두고 있어, 기본 상한 512에서 매핑당 초당 17연결
+정도를 견딥니다. 짧은 연결이 잦은 서비스를 얹는다면 이 값을 기준으로 상한을 올려야 합니다.
+
+`NEW_CONN_BURST=0`은 "버스트 없음"이 아니라 커널이 5패킷 허용치로 보정하는 값입니다.
+대역에 릴레이 자체 서비스 포트가 들어 있으면 기동을 거부합니다. 가드 규칙에는 counter를
+붙여 드롭이 관측되므로, 정상 트래픽 오탐과 실제 차단을 구분할 수 있습니다.
+
+## 시작하기
+
+```
+scripts/build.sh        # dist/relay-agent (정적, CGO 없음)
+scripts/verify.sh       # shellcheck + gofmt/vet/build/test + 공개 위생 검사
+```
+
+실행 모드는 둘입니다.
 
 ```
 relay-agent apply -file snapshot.json   # 1회 적용 + 보존
 relay-agent run                         # 부팅 재적용 → 폴링 루프
 ```
 
-## 남용 가드
+규칙 생성과 커널 커밋이 나뉘어 있어, 스냅샷에서 만들어지는 규칙 자체는 실제 커널 없이
+검증합니다.
 
-매핑마다 `ct count`(동시 연결 상한)와 신규 연결 rate limit이 붙습니다. 세 가드 모두
-조이는 방향(drop 상한)만 있어 기본값이 방화벽을 넓히지 않습니다.
-
-`ct count`가 세는 것은 살아 있는 연결이 아니라 conntrack 엔트리 수이고 TIME_WAIT도
-포함합니다. 그래서 매핑당 정상 지속 한도는 대략 `상한 ÷ TIME_WAIT 수명`입니다. 릴레이는
-순수 NAT 포워더라 TIME_WAIT를 30초로 두고 있어, 기본 상한 512에서 매핑당 초당 17연결
-정도를 견딥니다. 짧은 연결이 잦은 서비스를 얹는다면 이 값을 기준으로 상한을 올리세요.
-
-`NEW_CONN_BURST=0`은 "버스트 없음"이 아니라 커널이 5패킷 허용치로 보정하는 값입니다.
-대역에 릴레이 자체 서비스 포트가 들어 있으면 기동을 거부합니다. 가드 규칙에는 counter를
-붙여 드롭이 관측되므로, 정상 트래픽 오탐과 실제 차단을 구분할 수 있습니다.
+Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 하나입니다.
+`scripts/systemd/relay-agent.service`는 전용 사용자 `pickle-relay`에
+`AmbientCapabilities=CAP_NET_ADMIN`만 부여합니다.
 
 ## 구성
 
@@ -96,19 +122,61 @@ relay-agent run                         # 부팅 재적용 → 폴링 루프
 
 배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둡니다. 이 저장소에는 없습니다.
 
-## 시작하기
+## 전체 아키텍처
 
+```mermaid
+flowchart LR
+    subgraph ext [외부]
+        B[콘솔 접속]
+        V[VM 도메인 접속]
+        S[VM SSH 접속]
+        PC[VM 포트 접속]
+    end
+
+    subgraph relay [오프캠퍼스 릴레이]
+        HA[HAProxy :22]
+        NFT[nftables DNAT]
+        RA[pickle-relay-agent]
+    end
+
+    subgraph campus [부산대학교 서버팜]
+        PN[Pickle nginx]
+        VN[VM nginx]
+        C[pickle-console]
+        A[pickle-api]
+        J[JobRunr]
+        G[pickle-sshgw]
+        P[pickle-proxy-agent]
+        DB[(PostgreSQL)]
+        PVE[Proxmox VE]
+        VM[사용자 VM]
+    end
+
+    B --> PN
+    V --> VN
+    S --> HA
+    PC --> NFT
+
+    HA -->|WireGuard| G
+    NFT -->|WireGuard| VM
+    NFT -. 규칙 적용 .- RA
+    RA -->|sync| A
+
+    PN -->|/| C
+    PN -->|/api| A
+    PN -->|/terminal| G
+
+    G -->|인가 질의| A
+    G --> VM
+    VN --> VM
+
+    A --> DB
+    A -->|작업 등록| J
+    J -->|Proxmox API| PVE
+    A -->|도메인 설정| P
+    P -.->|vhost 적용| VN
+    PVE -.->|생성/제어| VM
 ```
-scripts/setup-hooks.sh  # 최초 1회: pre-commit(시크릿 스캔) + commit-msg(형식) 훅
-scripts/verify.sh       # shellcheck + gofmt/vet/build/test + 공개 위생 스캔
-scripts/build.sh        # dist/relay-agent (정적, CGO 없음)
-```
-
-Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 하나입니다.
-`scripts/systemd/relay-agent.service`는 전용 사용자 `pickle-relay`에
-`AmbientCapabilities=CAP_NET_ADMIN`만 부여합니다.
-
-## 관련 저장소
 
 | 저장소 | 역할 |
 |---|---|
@@ -121,13 +189,3 @@ Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 
 | [pickle-infra-example](https://github.com/PNUops/pickle-infra-example) | 프로비저닝·배포 스크립트와 런북 샘플 |
 | [pickle-secrets](https://github.com/PNUops/pickle-secrets) (비공개) | 호스트 시크릿 볼트 (git-crypt) |
 | [pickle-secrets-example](https://github.com/PNUops/pickle-secrets-example) | 볼트 레이아웃과 git-crypt 운용 절차 |
-
-## 커밋 규약
-
-`type: subject` 형식, 영어 명령형, 72자 이내입니다. commit-msg 훅이 강제합니다. 테스트
-픽스처는 RFC 5737 문서화 주소만 씁니다. 커밋 전에 `scripts/verify.sh`가 녹색이어야
-합니다.
-
-## 라이선스
-
-MIT
