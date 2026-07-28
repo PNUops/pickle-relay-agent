@@ -81,7 +81,7 @@ func run(log *slog.Logger) error {
 		default:
 			return fmt.Errorf("run: set PICKLE_RELAY_SYNC_URL (HTTP sync) or PICKLE_RELAY_SOURCE_FILE (local file)")
 		}
-		ag := agent.New(cfg, src, log)
+		ag := agent.New(cfg, src, agent.NFTKernel{}, log)
 		if err := ag.BootReapply(); err != nil {
 			return err
 		}

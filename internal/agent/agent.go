@@ -1,6 +1,7 @@
 // Package agent is the convergence loop: (re)apply persisted state at boot
 // within the allowed window, then poll the source and converge the kernel to
-// each new generation.
+// each new generation, reporting applied state and traffic counters upstream
+// with every sync.
 package agent
 
 import (
@@ -18,11 +19,34 @@ import (
 	"github.com/pnuops/pickle-relay-agent/internal/version"
 )
 
+// Kernel is the nftables surface the agent drives, injected so the
+// convergence logic is testable without CAP_NET_ADMIN or a kernel.
+type Kernel interface {
+	Apply(iface string, rules []nftctl.Rule, g nftctl.Guards) error
+	Present() (bool, error)
+	ReadCounters() (map[int64]nftctl.Counters, error)
+}
+
+// NFTKernel is the production Kernel, backed by the nftctl netlink calls.
+type NFTKernel struct{}
+
+// Apply implements Kernel.
+func (NFTKernel) Apply(iface string, rules []nftctl.Rule, g nftctl.Guards) error {
+	return nftctl.Apply(iface, rules, g)
+}
+
+// Present implements Kernel.
+func (NFTKernel) Present() (bool, error) { return nftctl.Present() }
+
+// ReadCounters implements Kernel.
+func (NFTKernel) ReadCounters() (map[int64]nftctl.Counters, error) { return nftctl.ReadCounters() }
+
 // Agent converges nftables to the desired mapping set.
 type Agent struct {
-	cfg *config.Config
-	src source.Source
-	log *slog.Logger
+	cfg    *config.Config
+	src    source.Source
+	kernel Kernel
+	log    *slog.Logger
 
 	// appliedGeneration is the last generation the kernel is KNOWN to hold.
 	// It never advances on a failed apply — that is the frozen-generation
@@ -34,11 +58,15 @@ type Agent struct {
 	// latest snapshot was rejected or failed to apply. Retained across
 	// cycles until an apply succeeds.
 	lastErr []source.ErrItem
+
+	// counters folds kernel counter reads into cumulative per-mapping
+	// totals (kernel counters reset on every table replace).
+	counters *counterState
 }
 
 // New builds an agent.
-func New(cfg *config.Config, src source.Source, log *slog.Logger) *Agent {
-	return &Agent{cfg: cfg, src: src, log: log}
+func New(cfg *config.Config, src source.Source, k Kernel, log *slog.Logger) *Agent {
+	return &Agent{cfg: cfg, src: src, kernel: k, log: log, counters: newCounterState()}
 }
 
 // BootReapply restores the persisted snapshot iff it is younger than the
@@ -51,7 +79,10 @@ func (a *Agent) BootReapply() error {
 	s, err := snapshot.LoadPersisted(path, a.cfg.Limits, a.cfg.SnapshotMaxAge, time.Now())
 	switch {
 	case err == nil:
-		if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
+		// fold whatever a previous run's table counted before the replace
+		// zeroes it (traffic that happened is traffic to report)
+		a.foldCounters()
+		if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 			return fmt.Errorf("boot re-apply: %w", err)
 		}
 		a.appliedGeneration, a.applied = s.Generation, true
@@ -65,7 +96,8 @@ func (a *Agent) BootReapply() error {
 		a.log.Warn("persisted snapshot rejected; converging to empty set", "reason", err)
 		_ = os.Remove(path)
 	}
-	if err := nftctl.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
+	a.foldCounters()
+	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
 		return fmt.Errorf("boot empty apply: %w", err)
 	}
 	a.appliedGeneration, a.applied = 0, true
@@ -78,7 +110,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	tick := time.NewTicker(a.cfg.PollInterval)
 	defer tick.Stop()
 	for {
-		a.cycle(ctx)
+		a.runOnce(ctx)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
@@ -87,20 +119,39 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
-func (a *Agent) cycle(ctx context.Context) {
+// runOnce is one poll iteration: a cycle plus, iff that cycle advanced the
+// generation, ONE immediate follow-up cycle — the follow-up's report is what
+// tells the server the new generation is applied, without waiting a full
+// tick. The follow-up's own outcome never triggers another one, and failures
+// never trigger any: only the timer re-enters, so nothing can tight-loop.
+func (a *Agent) runOnce(ctx context.Context) {
+	if a.cycle(ctx) {
+		a.cycle(ctx)
+	}
+}
+
+// cycle performs one sync exchange and converges the kernel if the desired
+// state changed. It returns true iff the applied generation ADVANCED (the
+// signal for the one-shot follow-up); failures, unchanged cycles and
+// same-generation self-heals return false.
+func (a *Agent) cycle(ctx context.Context) bool {
+	// read kernel counters first so even a no-change heartbeat reports
+	// fresh values
+	a.foldCounters()
 	rep := source.Report{
 		AppliedGeneration: a.appliedGeneration,
 		AgentVersion:      version.Version,
 		LastError:         a.lastErr,
+		Counters:          a.counters.Snapshot(),
 	}
 	body, changed, err := a.src.Sync(ctx, rep)
 	if err != nil {
 		// the POST itself was the report; nothing else to do until next tick
 		a.log.Warn("sync failed", "error", err)
-		return
+		return false
 	}
 	if !changed {
-		return
+		return false
 	}
 	s, err := snapshot.Parse(body, a.cfg.Limits)
 	if err != nil {
@@ -109,32 +160,55 @@ func (a *Agent) cycle(ctx context.Context) {
 		// the last good rule set stays
 		a.log.Error("snapshot rejected", "error", err)
 		a.setLastErr(err)
-		return
+		return false
 	}
 	if a.applied && s.Generation == a.appliedGeneration {
 		// Generation unchanged — normally a no-op, but re-assert if the kernel
 		// table was wiped out of band (e.g. an `nft flush ruleset` or an
 		// nftables restart without the ExecStop drop-in): otherwise the
 		// mappings would stay gone until the next mapping change.
-		if present, perr := nftctl.Present(); perr == nil && present {
-			return
+		if present, perr := a.kernel.Present(); perr == nil && present {
+			return false
 		} else if perr != nil {
 			a.log.Warn("table presence check failed; re-applying", "error", perr)
 		} else {
 			a.log.Warn("kernel table missing at unchanged generation; re-applying", "generation", s.Generation)
 		}
 	}
-	if err := nftctl.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
+	// fold again IMMEDIATELY before the replace: the atomic apply recreates
+	// every counter object at zero, so anything counted since the fold at
+	// the top of this cycle would otherwise be lost
+	a.foldCounters()
+	if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 		a.log.Error("apply failed; generation frozen", "generation", s.Generation, "error", err)
 		a.setLastErr(err)
-		return
+		return false
 	}
 	if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
 		a.log.Warn("persist failed (kernel state is applied)", "error", err)
 	}
+	advanced := !a.applied || s.Generation != a.appliedGeneration
 	a.appliedGeneration, a.applied = s.Generation, true
 	a.lastErr = nil
+	keep := make(map[int64]struct{}, len(s.Mappings))
+	for i := range s.Mappings {
+		keep[s.Mappings[i].ID] = struct{}{}
+	}
+	a.counters.Prune(keep)
 	a.log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
+	return advanced
+}
+
+// foldCounters merges the current kernel counter values into the cumulative
+// totals. A failed read (no table yet, transient netlink error) just means
+// the totals do not advance this round — never treated as zeros.
+func (a *Agent) foldCounters() {
+	read, err := a.kernel.ReadCounters()
+	if err != nil {
+		a.log.Debug("counter read failed", "error", err)
+		return
+	}
+	a.counters.Fold(read)
 }
 
 // setLastErr shapes err into the next report's error items. A per-mapping

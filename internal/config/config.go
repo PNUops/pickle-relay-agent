@@ -43,10 +43,10 @@ type Config struct {
 	// SyncToken is the per-relay bearer token for SyncURL. Required exactly
 	// when SyncURL is set; never defaulted.
 	SyncToken string
-	// Guards bounds each mapping's new-connection rate and concurrency — the
-	// real defense against the conntrack-exhaustion vector that shares fate
-	// with user SSH (sysctl sizing only raises the bar). Uniform across all
-	// mappings for now; per-mapping/per-source is a later milestone.
+	// Guards bounds each mapping's new-connection rate, concurrency and
+	// per-source rate — the real defense against the conntrack-exhaustion
+	// vector that shares fate with user SSH (sysctl sizing only raises the
+	// bar). These are the DEFAULTS; a snapshot may override them per mapping.
 	Guards nftctl.Guards
 }
 
