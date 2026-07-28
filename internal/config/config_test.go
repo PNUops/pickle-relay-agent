@@ -105,3 +105,93 @@ func TestLoadRejectsBadValues(t *testing.T) {
 		})
 	}
 }
+
+func TestPerSourceGuardDefaultsAndDisable(t *testing.T) {
+	setGood(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Guards.PerSourceRate != 50 || c.Guards.PerSourceBurst != 100 {
+		t.Fatalf("per-source defaults = %d/%d, want 50/100", c.Guards.PerSourceRate, c.Guards.PerSourceBurst)
+	}
+
+	t.Setenv("PICKLE_RELAY_PER_SOURCE_RATE", "0") // disable
+	t.Setenv("PICKLE_RELAY_PER_SOURCE_BURST", "250")
+	c, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Guards.PerSourceRate != 0 || c.Guards.PerSourceBurst != 250 {
+		t.Fatalf("per-source guards = %d/%d, want 0/250", c.Guards.PerSourceRate, c.Guards.PerSourceBurst)
+	}
+
+	t.Setenv("PICKLE_RELAY_PER_SOURCE_RATE", "abc")
+	if _, err := Load(); err == nil {
+		t.Fatal("bad per-source rate accepted")
+	}
+}
+
+func TestSyncEnvPairing(t *testing.T) {
+	// URL + token together: valid, both http and https schemes
+	for _, u := range []string{"https://api.example.test/internal/relays/1/sync", "http://192.0.2.10:8080/internal/relays/1/sync"} {
+		setGood(t)
+		t.Setenv("PICKLE_RELAY_SYNC_URL", u)
+		t.Setenv("PICKLE_RELAY_SYNC_TOKEN", "aabbcc")
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("%s: %v", u, err)
+		}
+		if c.SyncURL != u || c.SyncToken != "aabbcc" {
+			t.Fatalf("sync config = %q/%q", c.SyncURL, c.SyncToken)
+		}
+	}
+
+	// URL without token: refuse
+	setGood(t)
+	t.Setenv("PICKLE_RELAY_SYNC_URL", "https://api.example.test/sync")
+	t.Setenv("PICKLE_RELAY_SYNC_TOKEN", "")
+	if _, err := Load(); err == nil {
+		t.Fatal("URL without token accepted")
+	}
+	// token without URL: refuse (a token with nowhere to go is a config bug)
+	setGood(t)
+	t.Setenv("PICKLE_RELAY_SYNC_URL", "")
+	t.Setenv("PICKLE_RELAY_SYNC_TOKEN", "aabbcc")
+	if _, err := Load(); err == nil {
+		t.Fatal("token without URL accepted")
+	}
+}
+
+func TestSyncEnvRejectsBadValues(t *testing.T) {
+	cases := map[string][2]string{
+		"scheme ftp":     {"PICKLE_RELAY_SYNC_URL", "ftp://api.example.test/sync"},
+		"scheme missing": {"PICKLE_RELAY_SYNC_URL", "api.example.test/sync"},
+		"host missing":   {"PICKLE_RELAY_SYNC_URL", "https:///sync"},
+		"url garbage":    {"PICKLE_RELAY_SYNC_URL", "http://exa mple/sync"},
+		"token newline":  {"PICKLE_RELAY_SYNC_TOKEN", "aa\nbb"},
+		"token escape":   {"PICKLE_RELAY_SYNC_TOKEN", "aa\x1bbb"},
+		"token del char": {"PICKLE_RELAY_SYNC_TOKEN", "aa\x7fbb"},
+	}
+	for name, kv := range cases {
+		t.Run(name, func(t *testing.T) {
+			setGood(t)
+			t.Setenv("PICKLE_RELAY_SYNC_URL", "https://api.example.test/sync")
+			t.Setenv("PICKLE_RELAY_SYNC_TOKEN", "goodtoken")
+			t.Setenv(kv[0], kv[1])
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%q accepted", kv[0], kv[1])
+			}
+		})
+	}
+}
+
+func TestSyncSourceFileExclusion(t *testing.T) {
+	setGood(t)
+	t.Setenv("PICKLE_RELAY_SYNC_URL", "https://api.example.test/sync")
+	t.Setenv("PICKLE_RELAY_SYNC_TOKEN", "aabbcc")
+	t.Setenv("PICKLE_RELAY_SOURCE_FILE", "/tmp/snapshot.json")
+	if _, err := Load(); err == nil {
+		t.Fatal("sync URL and source file together accepted")
+	}
+}

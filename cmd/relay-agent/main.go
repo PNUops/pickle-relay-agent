@@ -71,13 +71,15 @@ func run(log *slog.Logger) error {
 		return nil
 
 	case "run":
+		// config.Load already guarantees these are mutually exclusive
 		var src source.Source
-		if cfg.SourceFile != "" {
+		switch {
+		case cfg.SyncURL != "":
+			src = source.NewHTTP(cfg.SyncURL, cfg.SyncToken)
+		case cfg.SourceFile != "":
 			src = source.FileSource{Path: cfg.SourceFile}
-		} else {
-			// the HTTP sync source arrives with the transport milestone;
-			// until then a file source must be configured explicitly
-			return fmt.Errorf("run: PICKLE_RELAY_SOURCE_FILE is required (sync transport not built yet)")
+		default:
+			return fmt.Errorf("run: set PICKLE_RELAY_SYNC_URL (HTTP sync) or PICKLE_RELAY_SOURCE_FILE (local file)")
 		}
 		ag := agent.New(cfg, src, log)
 		if err := ag.BootReapply(); err != nil {
