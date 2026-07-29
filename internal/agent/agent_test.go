@@ -331,6 +331,94 @@ func TestBootReapplyFoldsBeforeApply(t *testing.T) {
 	}
 }
 
+// bootTestAgent persists gen2Body and returns an agent whose boot re-apply
+// will load it.
+func bootTestAgent(t *testing.T, src *fakeSource, k *fakeKernel) *Agent {
+	t.Helper()
+	cfg := testConfig(t)
+	s, err := snapshot.Parse([]byte(gen2Body), cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Persist(cfg.SnapshotPath()); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SnapshotMaxAge = 24 * time.Hour
+	return New(cfg, src, k, slog.New(slog.DiscardHandler))
+}
+
+// TestBootFailureReportsAndRetries covers the failure path of a boot
+// re-apply: the agent must keep running (exiting would restart-loop the
+// service and hide the reason, which only travels upstream in a report),
+// report the failure at an unclaimed generation, and retry the converge.
+func TestBootFailureReportsAndRetries(t *testing.T) {
+	src := &fakeSource{responses: []syncResp{
+		{changed: false},
+		{body: []byte(gen2Body), changed: true},
+	}}
+	k := &fakeKernel{applyErrs: []error{context.DeadlineExceeded}}
+	a := bootTestAgent(t, src, k)
+
+	if err := a.BootReapply(); err == nil {
+		t.Fatal("a failed boot apply must be returned to the caller")
+	}
+	if a.applied || a.appliedGeneration != 0 {
+		t.Fatalf("failed boot claimed state: applied=%v generation=%d", a.applied, a.appliedGeneration)
+	}
+
+	a.cycle(context.Background())
+	rep := src.reports[0]
+	if rep.AppliedGeneration != 0 {
+		t.Fatalf("reported generation = %d, want 0 (nothing was applied)", rep.AppliedGeneration)
+	}
+	if len(rep.LastError) != 1 || rep.LastError[0].Message == "" {
+		t.Fatalf("boot failure not reported: %+v", rep.LastError)
+	}
+	if k.applyCalls != 2 {
+		t.Fatalf("apply calls = %d, want the failed boot plus a retry", k.applyCalls)
+	}
+	if !a.applied {
+		t.Fatal("a successful retry must establish the boot state")
+	}
+	if len(k.lastRules) != 0 {
+		t.Fatalf("the boot retry must converge to the empty set: %+v", k.lastRules)
+	}
+
+	// the desired state still lands normally afterwards
+	if advanced := a.cycle(context.Background()); !advanced {
+		t.Fatal("snapshot after a recovered boot failure must apply")
+	}
+	if a.appliedGeneration != 2 {
+		t.Fatalf("generation = %d, want 2", a.appliedGeneration)
+	}
+}
+
+func TestPersistentBootFailureClaimsNoGeneration(t *testing.T) {
+	src := &fakeSource{responses: []syncResp{{changed: false}, {changed: false}}}
+	k := &fakeKernel{applyErrs: []error{
+		context.DeadlineExceeded, context.DeadlineExceeded, context.DeadlineExceeded,
+	}}
+	a := bootTestAgent(t, src, k)
+	_ = a.BootReapply()
+
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	for i, rep := range src.reports {
+		if rep.AppliedGeneration != 0 {
+			t.Fatalf("report %d claims generation %d without a successful apply", i, rep.AppliedGeneration)
+		}
+		if len(rep.LastError) != 1 {
+			t.Fatalf("report %d dropped the failure: %+v", i, rep.LastError)
+		}
+	}
+	if a.applied {
+		t.Fatal("agent must not consider kernel state established")
+	}
+	if k.applyCalls != 3 {
+		t.Fatalf("apply calls = %d, want one retry per cycle", k.applyCalls)
+	}
+}
+
 func TestUnchangedCycleRepairsWipedTable(t *testing.T) {
 	src := &fakeSource{responses: []syncResp{
 		{body: []byte(gen2Body), changed: true}, // steady state: gen 2 applied

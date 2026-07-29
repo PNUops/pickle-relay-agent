@@ -67,6 +67,12 @@ type Agent struct {
 	// empty set), kept so an out-of-band table wipe can be repaired even on
 	// cycles where the source reports no change.
 	lastApplied *snapshot.Snapshot
+
+	// bootFailed marks a boot-time apply that did not take. Kernel state is
+	// then UNKNOWN (a previous run's table may still be live) and no
+	// desired-state change is guaranteed to come along and retry it, so the
+	// poll loop keeps re-attempting the boot converge until it succeeds.
+	bootFailed bool
 }
 
 // New builds an agent.
@@ -79,6 +85,13 @@ func New(cfg *config.Config, src source.Source, k Kernel, log *slog.Logger) *Age
 // converges the table to EMPTY instead (fail-closed): a released IP may have
 // been re-assigned to another tenant after quarantine, and a stale DNAT
 // would hand public traffic to the wrong VM.
+//
+// A failed apply is returned AND retained: the agent keeps no applied
+// generation (it must never claim state it did not establish), carries the
+// failure into the next sync report, and re-attempts the converge on the
+// poll loop. Callers are meant to log the error and run anyway — exiting
+// would restart-loop the service and hide the reason, which travels
+// upstream through the sync report.
 func (a *Agent) BootReapply() error {
 	path := a.cfg.SnapshotPath()
 	s, err := snapshot.LoadPersisted(path, a.cfg.Limits, a.cfg.SnapshotMaxAge, time.Now())
@@ -88,7 +101,7 @@ func (a *Agent) BootReapply() error {
 		// zeroes it (traffic that happened is traffic to report)
 		a.foldCounters()
 		if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
-			return fmt.Errorf("boot re-apply: %w", err)
+			return a.noteBootFailure(fmt.Errorf("boot re-apply: %w", err))
 		}
 		a.counters.MarkReset()
 		a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
@@ -108,11 +121,21 @@ func (a *Agent) BootReapply() error {
 	}
 	a.foldCounters()
 	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
-		return fmt.Errorf("boot empty apply: %w", err)
+		return a.noteBootFailure(fmt.Errorf("boot empty apply: %w", err))
 	}
 	a.counters.MarkReset()
 	a.appliedGeneration, a.applied, a.lastApplied = 0, true, nil
 	return nil
+}
+
+// noteBootFailure retains a failed boot apply so the poll loop can report and
+// retry it, and returns it unchanged for the caller to log. Nothing about the
+// applied state is touched: with no successful apply the agent holds no known
+// kernel state and keeps reporting generation 0.
+func (a *Agent) noteBootFailure(err error) error {
+	a.bootFailed = true
+	a.setLastErr(err)
+	return err
 }
 
 // Run polls the source until ctx ends. Apply failures freeze the reported
@@ -218,7 +241,7 @@ func (a *Agent) cycle(ctx context.Context) bool {
 	}
 	advanced := !a.applied || s.Generation != a.appliedGeneration
 	a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
-	a.lastErr = nil
+	a.bootFailed, a.lastErr = false, nil
 	keep := make(map[int64]struct{}, len(s.Mappings))
 	for i := range s.Mappings {
 		keep[s.Mappings[i].ID] = struct{}{}
@@ -237,6 +260,9 @@ func (a *Agent) cycle(ctx context.Context) bool {
 // re-apply is reported through lastError like any other apply failure.
 func (a *Agent) ensureAsserted() {
 	if !a.applied {
+		if a.bootFailed {
+			a.retryBootConverge()
+		}
 		return
 	}
 	present, err := a.kernel.Present()
@@ -262,6 +288,26 @@ func (a *Agent) ensureAsserted() {
 	}
 	a.counters.MarkReset()
 	a.log.Info("re-asserted", "generation", a.appliedGeneration, "mappings", n)
+}
+
+// retryBootConverge re-attempts the boot-time converge to the empty set after
+// a failed boot apply. It runs on unchanged cycles, which is exactly when
+// nothing else would: an unchanged answer means the platform desires
+// generation 0, so no snapshot is coming to carry the retry. The table is
+// re-applied WITHOUT a presence check, because a leftover table from the
+// previous run is present yet wrong. Until this succeeds the agent keeps
+// reporting generation 0 and the retained error.
+func (a *Agent) retryBootConverge() {
+	a.foldCounters()
+	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
+		a.log.Error("boot converge retry failed", "error", err)
+		a.setLastErr(err)
+		return
+	}
+	a.counters.MarkReset()
+	a.appliedGeneration, a.applied, a.lastApplied = 0, true, nil
+	a.bootFailed = false
+	a.log.Info("boot converge retry succeeded")
 }
 
 // foldCounters merges the current kernel counter values into the cumulative

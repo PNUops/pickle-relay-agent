@@ -86,7 +86,15 @@ func run(log *slog.Logger) error {
 		}
 		ag := agent.New(cfg, src, agent.NFTKernel{}, log)
 		if err := ag.BootReapply(); err != nil {
-			return err
+			// Do NOT exit: the service would restart every few seconds and the
+			// operator would never learn why, because the reason travels
+			// upstream in the sync report. The agent enters the poll loop with
+			// the failure retained as its current error, reports it on the next
+			// sync, and retries the converge each cycle. Fail-closed still
+			// holds: no apply succeeded, so it claims no generation and cannot
+			// be trusted with, or credited for, kernel state it never
+			// established.
+			log.Error("boot re-apply failed; continuing into the poll loop", "error", err)
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer stop()
