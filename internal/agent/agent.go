@@ -90,6 +90,7 @@ func (a *Agent) BootReapply() error {
 		if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 			return fmt.Errorf("boot re-apply: %w", err)
 		}
+		a.counters.MarkReset()
 		a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
 		// "boot re-apply" and "no persisted snapshot" below are stable
 		// message names at INFO: operational tooling matches these
@@ -109,6 +110,7 @@ func (a *Agent) BootReapply() error {
 	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
 		return fmt.Errorf("boot empty apply: %w", err)
 	}
+	a.counters.MarkReset()
 	a.appliedGeneration, a.applied, a.lastApplied = 0, true, nil
 	return nil
 }
@@ -199,6 +201,7 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		a.setLastErr(err)
 		return false
 	}
+	a.counters.MarkReset()
 	if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
 		a.log.Warn("persist failed (kernel state is applied)", "error", err)
 	}
@@ -246,6 +249,7 @@ func (a *Agent) ensureAsserted() {
 		a.setLastErr(err)
 		return
 	}
+	a.counters.MarkReset()
 	a.log.Info("re-asserted", "generation", a.appliedGeneration, "mappings", n)
 }
 

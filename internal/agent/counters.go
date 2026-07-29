@@ -59,10 +59,28 @@ func foldField(cum, last *uint64, k uint64) {
 	*last = k
 }
 
+// MarkReset zeroes every retained kernel baseline. Call immediately after a
+// successful table replace: the replace recreates all counter objects at
+// zero, and a stale baseline would make the next fold report only the part
+// of a reading that exceeds the OLD baseline (an undercount) whenever the
+// fresh counter happens to climb past it before the next read.
+func (cs *counterState) MarkReset() {
+	for _, mc := range cs.m {
+		mc.last = nftctl.Counters{}
+	}
+}
+
 // Prune drops state for mappings absent from the applied set — a deleted
 // mapping must stop appearing in reports (its id may eventually be reused by
 // an unrelated tenant's row only in a different generation history, and a
 // ghost entry would misattribute traffic).
+//
+// Accepted loss: the fold that runs immediately before the replace folds the
+// deleted mapping's final increment into its cumulative total, but the total
+// dies here before the next report can deliver it — the tail increment
+// between the last delivered report and deletion goes unreported. Accepted:
+// a deleted mapping has no row to account to, and the window is one poll
+// interval at most.
 func (cs *counterState) Prune(keep map[int64]struct{}) {
 	for id := range cs.m {
 		if _, ok := keep[id]; !ok {

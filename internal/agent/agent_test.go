@@ -384,3 +384,21 @@ func TestUnchangedCycleRepairFailureReportsError(t *testing.T) {
 		t.Fatalf("reported generation = %d, want 2", rep.AppliedGeneration)
 	}
 }
+
+func TestCycleResetsBaselinesAfterReplace(t *testing.T) {
+	src := &fakeSource{responses: []syncResp{
+		{body: []byte(gen2Body), changed: true}, // replace happens here
+		{changed: false},
+	}}
+	k := &fakeKernel{reads: []map[int64]nftctl.Counters{
+		{7: {NewConns: 5}}, // cycle 1, report fold
+		{7: {NewConns: 5}}, // cycle 1, pre-replace fold
+		{7: {NewConns: 7}}, // cycle 2: fresh counter already past the old baseline
+	}}
+	a := newTestAgent(t, src, k)
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	if got := src.reports[1].Counters[0].NewConns; got != 12 {
+		t.Fatalf("cumulative after replace = %d, want 12 (5 + fresh 7)", got)
+	}
+}
