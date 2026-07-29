@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -214,6 +215,39 @@ func TestGuardOverrideRejects(t *testing.T) {
 	ok := head + `"newConnRate":500,"perSourceRate":25}]}`
 	if _, err := Parse([]byte(ok), testLimits()); err != nil {
 		t.Fatalf("rate-only override rejected: %v", err)
+	}
+}
+
+// TestGuardOverrideCeiling covers the values the kernel would refuse: they
+// must fail per mapping (with the id attached) rather than reaching the
+// atomic batch, where the rejection names no row at all.
+func TestGuardOverrideCeiling(t *testing.T) {
+	head := `{"generation":1,"mappings":[{"id":9,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1,`
+	for field, tail := range map[string]string{
+		"ctMax":          `"ctMax":2147483647}]}`,
+		"newConnRate":    `"newConnRate":2147483647}]}`,
+		"newConnBurst":   `"newConnBurst":2147483647,"newConnRate":100}]}`,
+		"perSourceRate":  `"perSourceRate":2147483647}]}`,
+		"perSourceBurst": `"perSourceBurst":2147483647,"perSourceRate":100}]}`,
+	} {
+		_, err := Parse([]byte(head+tail), testLimits())
+		var ve *ValidationError
+		if !errors.As(err, &ve) {
+			t.Errorf("%s: want a per-mapping ValidationError, got %v", field, err)
+			continue
+		}
+		if ve.MappingID != 9 {
+			t.Errorf("%s: mapping id = %d, want 9", field, ve.MappingID)
+		}
+		if !strings.Contains(ve.Error(), field) {
+			t.Errorf("%s: error does not name the field: %v", field, ve)
+		}
+	}
+	// the ceiling itself is accepted
+	atMax := fmt.Sprintf(`%s"ctMax":%d,"newConnRate":%d,"newConnBurst":%d,"perSourceRate":%d,"perSourceBurst":%d}]}`,
+		head, MaxGuardValue, MaxGuardValue, MaxGuardValue, MaxGuardValue, MaxGuardValue)
+	if _, err := Parse([]byte(atMax), testLimits()); err != nil {
+		t.Fatalf("overrides at the ceiling rejected: %v", err)
 	}
 }
 

@@ -74,6 +74,18 @@ type Limits struct {
 // natural ceiling (one mapping per proto+port).
 const MaxMappings = 65536
 
+// MaxGuardValue is the upper bound on every per-mapping guard override.
+// These values become a kernel connlimit count or token-bucket rate/burst,
+// and a value the kernel refuses fails the WHOLE atomic batch: the apply
+// error names no mapping, so the operator sees the entire table frozen with
+// nothing identifying the offending row. Rejecting the value here turns it
+// into a per-mapping ValidationError that carries the id instead. The
+// ceiling matches the one the platform enforces when an override is set: a
+// million concurrent conntrack entries, or a million new connections per
+// second, is orders of magnitude past any relay's capacity, so no legitimate
+// configuration is excluded.
+const MaxGuardValue = 1_000_000
+
 // ValidationError marks a validation failure attributable to one mapping, so
 // callers can surface WHICH mapping was rejected (the sync report's error
 // items carry a mappingId). Retrieve with errors.As.
@@ -88,6 +100,15 @@ func (e *ValidationError) Unwrap() error { return e.Err }
 // mappingErr wraps a per-mapping validation failure.
 func mappingErr(id int64, format string, args ...any) error {
 	return &ValidationError{MappingID: id, Err: fmt.Errorf(format, args...)}
+}
+
+// guardCeiling rejects an override above MaxGuardValue. A nil override (keep
+// the agent default) and an explicit 0 (disable the guard) both pass.
+func guardCeiling[T uint32 | uint64](id int64, field string, v *T) error {
+	if v == nil || uint64(*v) <= MaxGuardValue {
+		return nil
+	}
+	return mappingErr(id, "%s %d exceeds the maximum %d", field, *v, MaxGuardValue)
 }
 
 // Validate checks every mapping against the limits and rejects duplicates.
@@ -152,6 +173,21 @@ func (s *Snapshot) Validate(lim Limits) error {
 		}
 		if m.PerSourceBurst != nil && (m.PerSourceRate == nil || *m.PerSourceRate == 0) {
 			return mappingErr(m.ID, "perSourceBurst requires a non-zero perSourceRate")
+		}
+		if err := guardCeiling(m.ID, "ctMax", m.CtMax); err != nil {
+			return err
+		}
+		if err := guardCeiling(m.ID, "newConnRate", m.NewConnRate); err != nil {
+			return err
+		}
+		if err := guardCeiling(m.ID, "newConnBurst", m.NewConnBurst); err != nil {
+			return err
+		}
+		if err := guardCeiling(m.ID, "perSourceRate", m.PerSourceRate); err != nil {
+			return err
+		}
+		if err := guardCeiling(m.ID, "perSourceBurst", m.PerSourceBurst); err != nil {
+			return err
 		}
 		key := [2]any{m.Proto, m.PublicPort}
 		if _, dup := seen[key]; dup {
