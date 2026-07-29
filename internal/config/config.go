@@ -8,6 +8,7 @@ package config
 import (
 	"fmt"
 	"net/netip"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,13 +34,19 @@ type Config struct {
 	// PollInterval is the sync poll cadence.
 	PollInterval time.Duration
 	// SourceFile, when set, feeds snapshots from a local file instead of the
-	// sync endpoint (bootstrap/testing; the HTTP source arrives with the
-	// transport milestone).
+	// sync endpoint (bootstrap/testing). Mutually exclusive with SyncURL.
 	SourceFile string
-	// Guards bounds each mapping's new-connection rate and concurrency — the
-	// real defense against the conntrack-exhaustion vector that shares fate
-	// with user SSH (sysctl sizing only raises the bar). Uniform across all
-	// mappings for now; per-mapping/per-source is a later milestone.
+	// SyncURL is the platform sync endpoint (full URL, the relay id is part
+	// of the path). Empty means no HTTP sync. No default on purpose: the
+	// sync target decides whose desired state shapes the firewall.
+	SyncURL string
+	// SyncToken is the per-relay bearer token for SyncURL. Required exactly
+	// when SyncURL is set; never defaulted.
+	SyncToken string
+	// Guards bounds each mapping's new-connection rate, concurrency and
+	// per-source rate — the real defense against the conntrack-exhaustion
+	// vector that shares fate with user SSH (sysctl sizing only raises the
+	// bar). These are the DEFAULTS; a snapshot may override them per mapping.
 	Guards nftctl.Guards
 }
 
@@ -52,16 +59,20 @@ func (c *Config) SnapshotPath() string { return filepath.Join(c.StateDir, "snaps
 var reservedRelayPorts = []uint16{2222, 51820}
 
 const (
-	envTargetCIDR   = "PICKLE_RELAY_TARGET_CIDR"
-	envBand         = "PICKLE_RELAY_PUBLIC_BAND"
-	envPublicIface  = "PICKLE_RELAY_PUBLIC_IFACE"
-	envMaxAgeH      = "PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS"
-	envPollSec      = "PICKLE_RELAY_POLL_SECONDS"
-	envSourceFile   = "PICKLE_RELAY_SOURCE_FILE"
-	envStateDir     = "STATE_DIRECTORY" // set by systemd StateDirectory=
-	envCtMax        = "PICKLE_RELAY_CT_MAX_PER_MAPPING"
-	envNewConnRate  = "PICKLE_RELAY_NEW_CONN_RATE"
-	envNewConnBurst = "PICKLE_RELAY_NEW_CONN_BURST"
+	envTargetCIDR     = "PICKLE_RELAY_TARGET_CIDR"
+	envBand           = "PICKLE_RELAY_PUBLIC_BAND"
+	envPublicIface    = "PICKLE_RELAY_PUBLIC_IFACE"
+	envMaxAgeH        = "PICKLE_RELAY_SNAPSHOT_MAX_AGE_HOURS"
+	envPollSec        = "PICKLE_RELAY_POLL_SECONDS"
+	envSourceFile     = "PICKLE_RELAY_SOURCE_FILE"
+	envSyncURL        = "PICKLE_RELAY_SYNC_URL"
+	envSyncToken      = "PICKLE_RELAY_SYNC_TOKEN"
+	envStateDir       = "STATE_DIRECTORY" // set by systemd StateDirectory=
+	envCtMax          = "PICKLE_RELAY_CT_MAX_PER_MAPPING"
+	envNewConnRate    = "PICKLE_RELAY_NEW_CONN_RATE"
+	envNewConnBurst   = "PICKLE_RELAY_NEW_CONN_BURST"
+	envPerSourceRate  = "PICKLE_RELAY_PER_SOURCE_RATE"
+	envPerSourceBurst = "PICKLE_RELAY_PER_SOURCE_BURST"
 )
 
 // Load reads and validates the configuration from the environment.
@@ -132,6 +143,35 @@ func Load() (*Config, error) {
 
 	c.SourceFile = os.Getenv(envSourceFile)
 
+	// Sync endpoint + token: both-or-neither, and no defaults — together
+	// they decide WHO gets to shape this firewall, which is exactly the
+	// class of value that must fail closed when missing or malformed.
+	c.SyncURL = os.Getenv(envSyncURL)
+	token := os.Getenv(envSyncToken)
+	if c.SyncURL != "" {
+		u, err := url.Parse(c.SyncURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("%s: %q is not an http(s) URL", envSyncURL, c.SyncURL)
+		}
+		if token == "" {
+			return nil, fmt.Errorf("%s is required when %s is set", envSyncToken, envSyncURL)
+		}
+		// Control characters cannot appear in a valid token and would
+		// corrupt the Authorization header — reject rather than send.
+		for _, r := range token {
+			if r < 0x20 || r == 0x7f {
+				return nil, fmt.Errorf("%s contains control characters", envSyncToken)
+			}
+		}
+		c.SyncToken = token
+	} else if token != "" {
+		return nil, fmt.Errorf("%s is set but %s is not", envSyncToken, envSyncURL)
+	}
+	if c.SyncURL != "" && c.SourceFile != "" {
+		return nil, fmt.Errorf("%s and %s are mutually exclusive (one desired-state authority)",
+			envSyncURL, envSourceFile)
+	}
+
 	// Abuse guards. Defaults are conservative (they only ever TIGHTEN the
 	// surface, so a default does not widen the firewall — unlike the
 	// firewall-shaping vars above) but env-overridable per relay. Set an env
@@ -146,6 +186,15 @@ func Load() (*Config, error) {
 	}
 	c.Guards.NewConnRate = uint64(rate)
 	c.Guards.NewConnBurst, err = uint32Env(envNewConnBurst, 400)
+	if err != nil {
+		return nil, err
+	}
+	psRate, err := uint32Env(envPerSourceRate, 50)
+	if err != nil {
+		return nil, err
+	}
+	c.Guards.PerSourceRate = uint64(psRate)
+	c.Guards.PerSourceBurst, err = uint32Env(envPerSourceBurst, 100)
 	if err != nil {
 		return nil, err
 	}

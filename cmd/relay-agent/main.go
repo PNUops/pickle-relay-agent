@@ -67,21 +67,34 @@ func run(log *slog.Logger) error {
 		if err := s.Persist(cfg.SnapshotPath()); err != nil {
 			return fmt.Errorf("applied, but persist failed: %w", err)
 		}
+		// The "applied" message and its INFO level are a stable surface:
+		// operational tooling matches success-path log lines by message name.
+		// Do not rename or demote without coordinating that tooling.
 		log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
 		return nil
 
 	case "run":
+		// config.Load already guarantees these are mutually exclusive
 		var src source.Source
-		if cfg.SourceFile != "" {
+		switch {
+		case cfg.SyncURL != "":
+			src = source.NewHTTP(cfg.SyncURL, cfg.SyncToken)
+		case cfg.SourceFile != "":
 			src = source.FileSource{Path: cfg.SourceFile}
-		} else {
-			// the HTTP sync source arrives with the transport milestone;
-			// until then a file source must be configured explicitly
-			return fmt.Errorf("run: PICKLE_RELAY_SOURCE_FILE is required (sync transport not built yet)")
+		default:
+			return fmt.Errorf("run: set PICKLE_RELAY_SYNC_URL (HTTP sync) or PICKLE_RELAY_SOURCE_FILE (local file)")
 		}
-		ag := agent.New(cfg, src, log)
+		ag := agent.New(cfg, src, agent.NFTKernel{}, log)
 		if err := ag.BootReapply(); err != nil {
-			return err
+			// Do NOT exit: the service would restart every few seconds and the
+			// operator would never learn why, because the reason travels
+			// upstream in the sync report. The agent enters the poll loop with
+			// the failure retained as its current error, reports it on the next
+			// sync, and retries the converge each cycle. Fail-closed still
+			// holds: no apply succeeded, so it claims no generation and cannot
+			// be trusted with, or credited for, kernel state it never
+			// established.
+			log.Error("boot re-apply failed; continuing into the poll loop", "error", err)
 		}
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 		defer stop()

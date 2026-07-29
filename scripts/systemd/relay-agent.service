@@ -17,8 +17,9 @@ PartOf=nftables.service
 Type=simple
 User=pickle-relay
 Group=pickle-relay
-# Deployment-specific values (target CIDR, band, public interface, poll) —
-# the agent fails closed if any firewall-shaping variable is missing.
+# Deployment-specific values (target CIDR, band, public interface, sync
+# endpoint and token) — the agent fails closed if any firewall-shaping
+# variable is missing.
 EnvironmentFile=/etc/pickle/relay-agent.env
 ExecStart=/opt/pickle/relay-agent/bin/relay-agent run
 Restart=on-failure
@@ -53,7 +54,7 @@ RestrictSUIDSGID=yes
 RestrictRealtime=yes
 RestrictNamespaces=yes
 MemoryDenyWriteExecute=yes
-# AF_NETLINK: nftables. AF_INET/AF_INET6: the sync poll (transport milestone).
+# AF_NETLINK: nftables. AF_INET/AF_INET6: the HTTP sync poll.
 RestrictAddressFamilies=AF_NETLINK AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM

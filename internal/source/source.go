@@ -1,8 +1,9 @@
 // Package source abstracts where desired-state snapshots come from. The
-// production source polls the platform sync endpoint (arrives with the
-// transport milestone); FileSource feeds a local file for bootstrap and
-// testing. Both return raw bytes — parsing/validation is the caller's job so
-// the firewall-config validation path is identical for every source.
+// production source POSTs the agent's report to the platform sync endpoint
+// and receives the snapshot in the response; FileSource feeds a local file
+// for bootstrap and testing. Both return raw bytes — parsing/validation is
+// the caller's job so the firewall-config validation path is identical for
+// every source.
 package source
 
 import (
@@ -10,30 +11,63 @@ import (
 	"os"
 )
 
-// Source yields the current desired-state snapshot bytes.
-type Source interface {
-	// Fetch returns the snapshot body. Implementations may use
-	// lastGeneration to skip unchanged payloads by returning changed=false
-	// (body is then ignored).
-	Fetch(ctx context.Context, lastGeneration int64) (body []byte, changed bool, err error)
-	// Report delivers apply results upstream (applied generation + errors).
-	// The file source ignores it; the sync source will carry it in the poll
-	// request body.
-	Report(ctx context.Context, appliedGeneration int64, applyErr error)
+// Report is the agent's side of a sync exchange: what the kernel currently
+// holds and what it has seen. It doubles as the heartbeat — every sync
+// carries it, whether or not the desired state changed.
+type Report struct {
+	// AppliedGeneration is the last generation the kernel is KNOWN to hold
+	// (never advanced on a failed apply).
+	AppliedGeneration int64 `json:"appliedGeneration"`
+	// AgentVersion identifies the running binary (build-stamped).
+	AgentVersion string `json:"agentVersion"`
+	// LastError reports why the latest snapshot could not be applied; empty
+	// when the agent is converged.
+	LastError []ErrItem `json:"lastError,omitempty"`
+	// Counters are the per-mapping traffic/drop totals, cumulative since
+	// agent start (the server treats any decrease as an agent restart).
+	Counters []MappingCounters `json:"counters,omitempty"`
 }
 
-// FileSource reads snapshots from a local JSON file.
+// ErrItem is one apply/validation failure. MappingID is set when the failure
+// is attributable to a single mapping.
+type ErrItem struct {
+	MappingID *int64 `json:"mappingId,omitempty"`
+	Message   string `json:"message"`
+}
+
+// MappingCounters is one mapping's cumulative counter readout.
+type MappingCounters struct {
+	MappingID        int64  `json:"mappingId"`
+	NewConns         uint64 `json:"newConns"`
+	InPackets        uint64 `json:"inPackets"`
+	InBytes          uint64 `json:"inBytes"`
+	OutPackets       uint64 `json:"outPackets"`
+	OutBytes         uint64 `json:"outBytes"`
+	RateDropped      uint64 `json:"rateDropped"`
+	ConnDropped      uint64 `json:"connDropped"`
+	PerSourceDropped uint64 `json:"perSourceDropped"`
+}
+
+// Source is one sync exchange: deliver the report upstream, get the desired
+// state back.
+type Source interface {
+	// Sync sends r and returns the current desired-state snapshot body.
+	// changed=false means the desired generation equals r.AppliedGeneration
+	// and there is nothing to apply (body is then nil). The report always
+	// goes with the exchange — there is no separate result-delivery call.
+	Sync(ctx context.Context, r Report) (body []byte, changed bool, err error)
+}
+
+// FileSource reads snapshots from a local JSON file. The report is ignored —
+// a file has no upstream to tell.
 type FileSource struct{ Path string }
 
-// Fetch implements Source. It always returns changed=true; the caller's
+// Sync implements Source. It always returns changed=true; the caller's
 // generation comparison makes re-applies idempotent and cheap.
-func (f FileSource) Fetch(_ context.Context, _ int64) ([]byte, bool, error) {
+func (f FileSource) Sync(_ context.Context, _ Report) ([]byte, bool, error) {
 	b, err := os.ReadFile(f.Path)
 	if err != nil {
 		return nil, false, err
 	}
 	return b, true, nil
 }
-
-// Report implements Source (no-op for files).
-func (FileSource) Report(context.Context, int64, error) {}
