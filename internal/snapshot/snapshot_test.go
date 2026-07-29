@@ -55,6 +55,9 @@ func TestParseRejects(t *testing.T) {
 		"duplicate":         `{"generation":1,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1},{"id":2,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.2","targetPort":2}]}`,
 		"gen 0 non-empty":   `{"generation":0,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1}]}`,
 		"duplicate id":      `{"generation":1,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1},{"id":1,"proto":"udp","publicPort":10001,"targetAddr":"192.0.2.2","targetPort":2}]}`,
+		// a non-positive id would name kernel counters the reader cannot parse
+		"zero id":     `{"generation":1,"mappings":[{"id":0,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1}]}`,
+		"negative id": `{"generation":1,"mappings":[{"id":-1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":1}]}`,
 	}
 	for name, js := range cases {
 		if _, err := Parse([]byte(js), testLimits()); err == nil {
