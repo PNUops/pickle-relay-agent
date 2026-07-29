@@ -51,11 +51,12 @@ func (f *fakeSource) Sync(_ context.Context, r source.Report) ([]byte, bool, err
 // fakeKernel scripts counter readouts and apply outcomes, and records the
 // event order (the fold-before-replace property is an ordering claim).
 type fakeKernel struct {
-	events     []string
-	applyErrs  []error                     // popped per Apply call; empty → success
-	reads      []map[int64]nftctl.Counters // popped per ReadCounters call
-	lastRules  []nftctl.Rule
-	applyCalls int
+	events         []string
+	applyErrs      []error                     // popped per Apply call; empty → success
+	reads          []map[int64]nftctl.Counters // popped per ReadCounters call
+	presentResults []bool                      // popped per Present call; empty → true
+	lastRules      []nftctl.Rule
+	applyCalls     int
 }
 
 func (k *fakeKernel) Apply(_ string, rules []nftctl.Rule, _ nftctl.Guards) error {
@@ -74,7 +75,12 @@ func (k *fakeKernel) Apply(_ string, rules []nftctl.Rule, _ nftctl.Guards) error
 
 func (k *fakeKernel) Present() (bool, error) {
 	k.events = append(k.events, "present")
-	return true, nil
+	if len(k.presentResults) == 0 {
+		return true, nil
+	}
+	p := k.presentResults[0]
+	k.presentResults = k.presentResults[1:]
+	return p, nil
 }
 
 func (k *fakeKernel) ReadCounters() (map[int64]nftctl.Counters, error) {
@@ -322,5 +328,59 @@ func TestBootReapplyFoldsBeforeApply(t *testing.T) {
 	c := src.reports[0].Counters
 	if len(c) != 1 || c[0].NewConns != 42 {
 		t.Fatalf("boot-folded counters = %+v, want NewConns 42", c)
+	}
+}
+
+func TestUnchangedCycleRepairsWipedTable(t *testing.T) {
+	src := &fakeSource{responses: []syncResp{
+		{body: []byte(gen2Body), changed: true}, // steady state: gen 2 applied
+		{changed: false},                        // table wiped out of band
+		{changed: false},                        // table back: no extra apply
+	}}
+	k := &fakeKernel{presentResults: []bool{false, true}}
+	a := newTestAgent(t, src, k)
+
+	a.cycle(context.Background())
+	if k.applyCalls != 1 {
+		t.Fatalf("applies after steady state = %d", k.applyCalls)
+	}
+	if advanced := a.cycle(context.Background()); advanced {
+		t.Fatal("re-assert must not report an advance")
+	}
+	if k.applyCalls != 2 {
+		t.Fatalf("wiped table not re-applied (applies = %d)", k.applyCalls)
+	}
+	if len(k.lastRules) != 1 || k.lastRules[0].MappingID != 7 {
+		t.Fatalf("re-assert applied wrong rules: %+v", k.lastRules)
+	}
+	if a.appliedGeneration != 2 {
+		t.Fatalf("generation = %d, want 2 (unchanged by re-assert)", a.appliedGeneration)
+	}
+	a.cycle(context.Background())
+	if k.applyCalls != 2 {
+		t.Fatalf("healthy table must not be re-applied (applies = %d)", k.applyCalls)
+	}
+}
+
+func TestUnchangedCycleRepairFailureReportsError(t *testing.T) {
+	src := &fakeSource{responses: []syncResp{
+		{body: []byte(gen2Body), changed: true},
+		{changed: false}, // wipe detected, re-assert fails
+		{changed: false},
+	}}
+	k := &fakeKernel{
+		presentResults: []bool{false},
+		applyErrs:      []error{nil, context.DeadlineExceeded},
+	}
+	a := newTestAgent(t, src, k)
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	rep := src.reports[2]
+	if len(rep.LastError) != 1 {
+		t.Fatalf("failed re-assert not reported: %+v", rep.LastError)
+	}
+	if rep.AppliedGeneration != 2 {
+		t.Fatalf("reported generation = %d, want 2", rep.AppliedGeneration)
 	}
 }

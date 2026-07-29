@@ -62,6 +62,11 @@ type Agent struct {
 	// counters folds kernel counter reads into cumulative per-mapping
 	// totals (kernel counters reset on every table replace).
 	counters *counterState
+
+	// lastApplied is the snapshot the kernel currently holds (nil = the
+	// empty set), kept so an out-of-band table wipe can be repaired even on
+	// cycles where the source reports no change.
+	lastApplied *snapshot.Snapshot
 }
 
 // New builds an agent.
@@ -85,7 +90,7 @@ func (a *Agent) BootReapply() error {
 		if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
 			return fmt.Errorf("boot re-apply: %w", err)
 		}
-		a.appliedGeneration, a.applied = s.Generation, true
+		a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
 		// "boot re-apply" and "no persisted snapshot" below are stable
 		// message names at INFO: operational tooling matches these
 		// success-path lines. Do not rename or demote them without
@@ -104,7 +109,7 @@ func (a *Agent) BootReapply() error {
 	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
 		return fmt.Errorf("boot empty apply: %w", err)
 	}
-	a.appliedGeneration, a.applied = 0, true
+	a.appliedGeneration, a.applied, a.lastApplied = 0, true, nil
 	return nil
 }
 
@@ -155,6 +160,12 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		return false
 	}
 	if !changed {
+		// The desired state did not change, but the kernel may have — an
+		// out-of-band wipe (`nft flush ruleset`, an nftables restart without
+		// the ExecStop drop-in) would otherwise persist until the next
+		// mapping change, since only changed cycles used to look at the
+		// kernel at all.
+		a.ensureAsserted()
 		return false
 	}
 	s, err := snapshot.Parse(body, a.cfg.Limits)
@@ -192,7 +203,7 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		a.log.Warn("persist failed (kernel state is applied)", "error", err)
 	}
 	advanced := !a.applied || s.Generation != a.appliedGeneration
-	a.appliedGeneration, a.applied = s.Generation, true
+	a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
 	a.lastErr = nil
 	keep := make(map[int64]struct{}, len(s.Mappings))
 	for i := range s.Mappings {
@@ -204,6 +215,38 @@ func (a *Agent) cycle(ctx context.Context) bool {
 	// coordinating that tooling.
 	a.log.Info("applied", "generation", s.Generation, "mappings", len(s.Mappings))
 	return advanced
+}
+
+// ensureAsserted repairs an out-of-band kernel table wipe: when the table is
+// missing (or its presence cannot be determined), the last applied snapshot
+// is re-applied at the SAME generation — no advance, no follow-up. A failed
+// re-apply is reported through lastError like any other apply failure.
+func (a *Agent) ensureAsserted() {
+	if !a.applied {
+		return
+	}
+	present, err := a.kernel.Present()
+	if err == nil && present {
+		return
+	}
+	if err != nil {
+		a.log.Warn("table presence check failed; re-asserting", "error", err)
+	} else {
+		a.log.Warn("kernel table missing; re-asserting", "generation", a.appliedGeneration)
+	}
+	var (
+		rules []nftctl.Rule
+		n     int
+	)
+	if a.lastApplied != nil {
+		rules, n = nftctl.Plan(a.lastApplied), len(a.lastApplied.Mappings)
+	}
+	if err := a.kernel.Apply(a.cfg.PublicIface, rules, a.cfg.Guards); err != nil {
+		a.log.Error("re-assert failed", "generation", a.appliedGeneration, "error", err)
+		a.setLastErr(err)
+		return
+	}
+	a.log.Info("re-asserted", "generation", a.appliedGeneration, "mappings", n)
 }
 
 // foldCounters merges the current kernel counter values into the cumulative
