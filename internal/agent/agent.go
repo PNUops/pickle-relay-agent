@@ -162,6 +162,14 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		return false
 	}
 	if !changed {
+		// An unchanged answer means the server compared the desired
+		// generation against the applied one we just reported and they are
+		// EQUAL — so a retained error describes a snapshot the platform no
+		// longer desires (e.g. the operator reverted the offending mapping).
+		// Clear it, or the console would show a stale 적용 실패 forever.
+		// Cleared before the re-assert below so a re-assert failure still
+		// surfaces.
+		a.lastErr = nil
 		// The desired state did not change, but the kernel may have — an
 		// out-of-band wipe (`nft flush ruleset`, an nftables restart without
 		// the ExecStop drop-in) would otherwise persist until the next
@@ -185,6 +193,9 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		// nftables restart without the ExecStop drop-in): otherwise the
 		// mappings would stay gone until the next mapping change.
 		if present, perr := a.kernel.Present(); perr == nil && present {
+			// converged at this generation with the table intact: any
+			// retained error is stale (same reasoning as the unchanged path)
+			a.lastErr = nil
 			return false
 		} else if perr != nil {
 			a.log.Warn("table presence check failed; re-applying", "error", perr)

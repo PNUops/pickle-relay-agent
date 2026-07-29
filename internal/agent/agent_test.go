@@ -402,3 +402,30 @@ func TestCycleResetsBaselinesAfterReplace(t *testing.T) {
 		t.Fatalf("cumulative after replace = %d, want 12 (5 + fresh 7)", got)
 	}
 }
+
+func TestUnchangedAnswerClearsStaleError(t *testing.T) {
+	// generation 3 fails to apply, then the operator reverts it server-side:
+	// the next sync answers unchanged (desired == applied == 2) and the
+	// retained error must clear instead of showing a stale failure forever.
+	gen3bad := `{"generation":3,"mappings":[{"id":8,"proto":"tcp","publicPort":10081,"targetAddr":"192.0.2.9","targetPort":81}]}`
+	src := &fakeSource{responses: []syncResp{
+		{body: []byte(gen2Body), changed: true},
+		{body: []byte(gen3bad), changed: true}, // apply fails → lastErr
+		{changed: false},                       // server reverted: converged at 2
+		{changed: false},
+	}}
+	k := &fakeKernel{applyErrs: []error{nil, context.DeadlineExceeded}}
+	a := newTestAgent(t, src, k)
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	a.cycle(context.Background())
+	if len(src.reports[2].LastError) != 1 {
+		t.Fatalf("report 2 must still carry the failure: %+v", src.reports[2].LastError)
+	}
+	a.cycle(context.Background())
+	rep := src.reports[3]
+	if rep.AppliedGeneration != 2 || len(rep.LastError) != 0 {
+		t.Fatalf("stale error not cleared after revert: gen=%d lastError=%+v",
+			rep.AppliedGeneration, rep.LastError)
+	}
+}
