@@ -103,9 +103,12 @@ func TestPersistRoundTripAndAgeBound(t *testing.T) {
 
 func TestParseRejectsNullAndTrailing(t *testing.T) {
 	for name, js := range map[string]string{
-		"null body":     "null",
-		"null spaced":   "  null\n",
-		"trailing data": `{"generation":1,"mappings":[]}{"x":1}`,
+		"null body":        "null",
+		"null spaced":      "  null\n",
+		"trailing data":    `{"generation":1,"mappings":[]}{"x":1}`,
+		"mappings null":    `{"generation":4,"mappings":null}`,
+		"mappings absent":  `{"generation":4}`,
+		"generation alone": `{"generation":0}`,
 	} {
 		if _, err := Parse([]byte(js), testLimits()); err == nil {
 			t.Errorf("%s: accepted, want error", name)

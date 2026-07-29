@@ -103,6 +103,13 @@ func (s *Snapshot) Validate(lim Limits) error {
 	if s.Generation == 0 && len(s.Mappings) > 0 {
 		return errors.New("generation 0 with non-empty mappings (real generations start at 1)")
 	}
+	// An empty desired set must be the EXPLICIT `"mappings": []` — an absent
+	// or null mappings key decodes to the same nil slice a truncated or
+	// mis-serialized body would, and applying it would flush every rule.
+	// Reject so a serialization slip upstream cannot become a full outage.
+	if s.Mappings == nil {
+		return errors.New("mappings key absent or null (an empty set must be an explicit [])")
+	}
 	if len(s.Mappings) > MaxMappings {
 		return fmt.Errorf("%d mappings exceeds cap %d", len(s.Mappings), MaxMappings)
 	}
