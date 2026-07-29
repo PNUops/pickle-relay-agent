@@ -260,8 +260,8 @@ func TestPlanCarriesOverrides(t *testing.T) {
 }
 
 // TestForwardRules pins the counting rules: per mapping an in-rule (iifname)
-// and an out-rule (oifname), both selecting by ct original proto-dst, ending
-// in the named counter and NO verdict (counting only).
+// and an out-rule (oifname), both selecting by ct original proto-dst AND
+// ct status dnat, ending in the named counter and NO verdict (counting only).
 func TestForwardRules(t *testing.T) {
 	rules := Plan(testSnapshot(t)) // 2 mappings
 	fwd := renderForwardRules("eth0", rules)
@@ -276,6 +276,9 @@ func TestForwardRules(t *testing.T) {
 		t.Fatalf("out rule expr 0 = %#v, want oifname", out[0])
 	}
 	for name, exprs := range map[string][]expr.Any{"in": in, "out": out} {
+		if len(exprs) != 10 {
+			t.Fatalf("%s rule expr count = %d, want 10", name, len(exprs))
+		}
 		if c, ok := exprs[1].(*expr.Cmp); !ok || string(c.Data[:4]) != "eth0" || len(c.Data) != 16 {
 			t.Fatalf("%s rule expr 1 = %#v, want 16-byte ifname cmp", name, exprs[1])
 		}
@@ -289,14 +292,25 @@ func TestForwardRules(t *testing.T) {
 		if c, ok := exprs[5].(*expr.Cmp); !ok || binary.BigEndian.Uint16(c.Data) != 10080 {
 			t.Fatalf("%s rule expr 5 = %#v, want public port 10080", name, exprs[5])
 		}
+		// ct status dnat: status load, mask to the DNAT bit, must be non-zero
+		if ct, ok := exprs[6].(*expr.Ct); !ok || ct.Key != expr.CtKeySTATUS {
+			t.Fatalf("%s rule expr 6 = %#v, want ct status", name, exprs[6])
+		}
+		bw, ok := exprs[7].(*expr.Bitwise)
+		if !ok || bw.Len != 4 || binary.NativeEndian.Uint32(bw.Mask) != ctStatusDNAT {
+			t.Fatalf("%s rule expr 7 = %#v, want bitwise mask 0x20", name, exprs[7])
+		}
+		if c, ok := exprs[8].(*expr.Cmp); !ok || c.Op != expr.CmpOpNeq || binary.NativeEndian.Uint32(c.Data) != 0 {
+			t.Fatalf("%s rule expr 8 = %#v, want cmp neq 0", name, exprs[8])
+		}
 		// last expr is the counter — no verdict follows (counting only)
 		if _, ok := exprs[len(exprs)-1].(*expr.Objref); !ok {
 			t.Fatalf("%s rule must end in the named counter, got %#v", name, exprs[len(exprs)-1])
 		}
 	}
-	if in[6].(*expr.Objref).Name != "m11_in" || out[6].(*expr.Objref).Name != "m11_out" {
+	if in[9].(*expr.Objref).Name != "m11_in" || out[9].(*expr.Objref).Name != "m11_out" {
 		t.Fatalf("counter names = %q/%q, want m11_in/m11_out",
-			in[6].(*expr.Objref).Name, out[6].(*expr.Objref).Name)
+			in[9].(*expr.Objref).Name, out[9].(*expr.Objref).Name)
 	}
 	// udp mapping's rules select udp
 	if c := fwd[2][3].(*expr.Cmp); c.Data[0] != protoUDP {

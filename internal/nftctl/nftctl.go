@@ -514,6 +514,11 @@ func renderForwardRules(iface string, rules []Rule) [][]expr.Any {
 // flow's original direction (client → relay public port).
 const ctDirOriginal = 0
 
+// ctStatusDNAT is IPS_DST_NAT from the kernel's conntrack status bits: the
+// flow has a destination-NAT binding. The ct status register is a host-endian
+// u32, so the bitwise mask below uses native byte order.
+const ctStatusDNAT = 0x20
+
 func forwardCountExprs(iface string, r *Rule, ifKey expr.MetaKey, counterSuffix string) []expr.Any {
 	proto := byte(protoTCP)
 	if r.Proto == snapshot.ProtoUDP {
@@ -521,6 +526,8 @@ func forwardCountExprs(iface string, r *Rule, ifKey expr.MetaKey, counterSuffix 
 	}
 	pubPort := make([]byte, 2)
 	binary.BigEndian.PutUint16(pubPort, r.PublicPort)
+	dnatMask := make([]byte, 4)
+	binary.NativeEndian.PutUint32(dnatMask, ctStatusDNAT)
 	return []expr.Any{
 		// public interface on the matching side (in: ingress, out: egress);
 		// the other side is the tunnel
@@ -531,6 +538,13 @@ func forwardCountExprs(iface string, r *Rule, ifKey expr.MetaKey, counterSuffix 
 		// ct original proto-dst == publicPort (see renderForwardRules)
 		&expr.Ct{Register: 1, Key: expr.CtKeyPROTODST, Direction: ctDirOriginal},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: pubPort},
+		// ct status dnat: only flows this table's DNAT actually translated.
+		// Without it, traffic to a relay-local listener on the same port
+		// (or any non-DNAT flow the interface+port match happens to catch)
+		// would pollute the mapping's byte counts.
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: dnatMask, Xor: make([]byte, 4)},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)},
 		objrefCounter(r.MappingID, counterSuffix),
 	}
 }
