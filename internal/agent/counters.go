@@ -18,6 +18,10 @@ import (
 // promises (the server treats any decrease as an agent restart).
 type counterState struct {
 	m map[int64]*mappingCounter
+
+	// cursor is where the next report resumes when the live mapping count
+	// exceeds maxReportedCounters (0 = start from the lowest id).
+	cursor int64
 }
 
 type mappingCounter struct {
@@ -89,14 +93,56 @@ func (cs *counterState) Prune(keep map[int64]struct{}) {
 	}
 }
 
+// maxReportedCounters bounds how many counter rows a single report carries.
+// The sync request body is capped at 1 MiB upstream, so an array that grows
+// with the live mapping count is a hard ceiling: past it every exchange fails
+// and the desired-state channel freezes (suspend and delete never arrive
+// while the existing rules keep serving). At this cap the counters array
+// serializes to a few hundred KB, well inside the body limit, and still
+// covers in one report every mapping a single relay realistically holds.
+const maxReportedCounters = 2000
+
 // Snapshot renders the cumulative totals for the sync report, sorted by
 // mapping id so report payloads are deterministic.
+//
+// At most maxReportedCounters rows are returned. When more mappings are live
+// the window ROTATES: each report resumes after the last id it sent and wraps
+// around at the end, so every mapping is reported within ceil(n/cap)
+// consecutive reports and none starves. Rotation costs no accuracy because
+// reported values are cumulative rather than deltas — a mapping left out of
+// one report keeps accumulating in Fold, and its next appearance carries the
+// full total including the skipped window.
 func (cs *counterState) Snapshot() []source.MappingCounters {
 	if len(cs.m) == 0 {
 		return nil
 	}
-	out := make([]source.MappingCounters, 0, len(cs.m))
-	for id, mc := range cs.m {
+	ids := make([]int64, 0, len(cs.m))
+	for id := range cs.m {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+
+	total := len(ids)
+	count, start := total, 0
+	if total > maxReportedCounters {
+		count = maxReportedCounters
+		// resume at the first id at or after the cursor; a cursor beyond the
+		// last id (or on a mapping pruned since) wraps to the front
+		start = sort.Search(total, func(i int) bool { return ids[i] >= cs.cursor })
+		if start == total {
+			start = 0
+		}
+		cs.cursor = ids[(start+count)%total]
+	} else {
+		// back under the cap: every mapping fits again, so the next report
+		// starts from the front
+		cs.cursor = 0
+	}
+
+	out := make([]source.MappingCounters, 0, count)
+	for i := 0; i < count; i++ {
+		id := ids[(start+i)%total]
+		mc := cs.m[id]
 		out = append(out, source.MappingCounters{
 			MappingID:        id,
 			NewConns:         mc.cum.NewConns,
@@ -109,6 +155,7 @@ func (cs *counterState) Snapshot() []source.MappingCounters {
 			PerSourceDropped: mc.cum.PerSourceDropped,
 		})
 	}
+	// a wrapped window is gathered out of order; the report stays ascending
 	sort.Slice(out, func(i, j int) bool { return out[i].MappingID < out[j].MappingID })
 	return out
 }
