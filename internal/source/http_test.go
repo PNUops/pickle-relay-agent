@@ -232,3 +232,17 @@ func TestSanitizeMessageKeepsPlainText(t *testing.T) {
 		t.Fatalf("plain text mangled: %q", got)
 	}
 }
+
+func TestHTTPClientIgnoresEnvProxy(t *testing.T) {
+	// If the client honored HTTP_PROXY, this request would go to a dead
+	// port and fail instead of reaching the test server directly.
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"generation":0}`))
+	}))
+	defer srv.Close()
+	if _, _, err := NewHTTP(srv.URL, "t").Sync(context.Background(), Report{}); err != nil {
+		t.Fatalf("env proxy leaked into the sync client: %v", err)
+	}
+}

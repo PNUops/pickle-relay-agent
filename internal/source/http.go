@@ -43,6 +43,11 @@ type HTTPSource struct {
 func NewHTTP(url, token string) *HTTPSource {
 	return &HTTPSource{url: url, token: token, client: &http.Client{
 		Timeout: requestTimeout,
+		// Explicit transport with NO proxy: the default transport honors
+		// HTTP(S)_PROXY from the environment, which would route the bearer
+		// token through whatever host those variables name. The sync target
+		// is a direct tunnel address; a proxy is never correct here.
+		Transport: &http.Transport{Proxy: nil},
 		// Never chase redirects: the sync endpoint answers in place, and a
 		// redirect must not be followed with the bearer token attached. The
 		// 3xx surfaces below as an unexpected status instead.
