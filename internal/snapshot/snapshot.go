@@ -114,8 +114,15 @@ func (s *Snapshot) Validate(lim Limits) error {
 		return fmt.Errorf("%d mappings exceeds cap %d", len(s.Mappings), MaxMappings)
 	}
 	seen := make(map[[2]any]struct{}, len(s.Mappings))
+	seenID := make(map[int64]struct{}, len(s.Mappings))
 	for i := range s.Mappings {
 		m := &s.Mappings[i]
+		// Duplicate ids would collide on the per-mapping kernel object names
+		// (counters, per-source set) and make error attribution ambiguous.
+		if _, dup := seenID[m.ID]; dup {
+			return mappingErr(m.ID, "duplicate mapping id")
+		}
+		seenID[m.ID] = struct{}{}
 		if m.Proto != ProtoTCP && m.Proto != ProtoUDP {
 			return mappingErr(m.ID, "unknown proto %q", m.Proto)
 		}
