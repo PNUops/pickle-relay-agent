@@ -20,7 +20,7 @@
 ## 주요 기능
 
 플랫폼은 VM 신청·승인·생성, SSH와 웹 터미널 접속, 도메인 공개, 만료와
-삭제까지를 다룹니다. 이 저장소가 맡는 부분은 아래와 같습니다.
+삭제까지를 다룹니다. 이 레포지토리가 맡는 부분은 아래와 같습니다.
 
 - **매핑 수렴**: 플랫폼이 정한 공인 포트에서 VM 포트로 가는 매핑을 릴레이 호스트의
   방화벽에 반영합니다.
@@ -183,11 +183,11 @@ Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 
 | `PICKLE_RELAY_NEW_CONN_RATE` / `_BURST` | | 매핑당 신규 연결 pps 상한과 버스트 (기본 200/400) |
 | `PICKLE_RELAY_PER_SOURCE_RATE` / `_BURST` | | 출발지 IP당 신규 연결 pps 상한과 버스트 (기본 50/100, rate `0`이면 끔) |
 
-배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둡니다. 이 저장소에는 없습니다.
+배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둡니다. 이 레포지토리에는 없습니다.
 
 ## 전체 아키텍처
 
-<!-- arch:begin — 저장소 공통 블록입니다. 손으로 고치지 마세요. -->
+<!-- arch:begin — 레포지토리 공통 블록입니다. 손으로 고치지 마세요. -->
 ```mermaid
 flowchart LR
     subgraph ext [외부]
@@ -244,7 +244,7 @@ flowchart LR
     IB -.->|템플릿 빌드| PVE
 ```
 
-| 저장소 | 역할 |
+| 레포지토리 | 역할 |
 |---|---|
 | [pickle-api](https://github.com/PNUops/pickle-api) | REST API와 프로비저닝 워커 (Spring Boot 4, Java 25, PostgreSQL 18, JobRunr) |
 | [pickle-console](https://github.com/PNUops/pickle-console) | 사용자·관리자 웹 콘솔 (React 19, TypeScript) |
