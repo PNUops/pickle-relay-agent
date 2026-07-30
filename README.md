@@ -102,7 +102,7 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 적용하지 않습니다.
 
 - **응답 파싱은 엄격합니다.** 모르는 필드가 있으면 스냅샷 전체를 거부합니다. 그래서
-  응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 계약 규칙입니다.
+  응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 명세 규칙입니다.
 - **counters는 기동 이후 누적값입니다.** 에이전트가 재시작하면 0부터 다시 시작하므로,
   서버는 값이 줄어든 것을 재시작으로 처리합니다.
 - **counters는 보고 한 건당 최대 2000행**입니다. 살아 있는 매핑이 그보다 많으면 보고가
@@ -187,6 +187,7 @@ Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 
 
 ## 전체 아키텍처
 
+<!-- arch:begin — 저장소 공통 블록입니다. 손으로 고치지 마세요. -->
 ```mermaid
 flowchart LR
     subgraph ext [외부]
@@ -213,6 +214,7 @@ flowchart LR
         DB[(PostgreSQL)]
         PVE[Proxmox VE]
         VM[사용자 VM]
+        IB[pickle-image-builder]
     end
 
     B --> PN
@@ -239,6 +241,7 @@ flowchart LR
     A -->|도메인 설정| P
     P -.->|vhost 적용| VN
     PVE -.->|생성/제어| VM
+    IB -.->|템플릿 빌드| PVE
 ```
 
 | 저장소 | 역할 |
@@ -248,7 +251,9 @@ flowchart LR
 | [pickle-sshgw](https://github.com/PNUops/pickle-sshgw) | SSH 게이트웨이와 웹 터미널 브리지 (sshpiperd, Go) |
 | [pickle-proxy-agent](https://github.com/PNUops/pickle-proxy-agent) | nginx 리버스 프록시 제어 에이전트 (Go) |
 | [pickle-relay-agent](https://github.com/PNUops/pickle-relay-agent) | 오프캠퍼스 릴레이의 nftables DNAT 에이전트 (Go) |
+| [pickle-image-builder](https://github.com/PNUops/pickle-image-builder) | 사용자 VM OS 이미지 빌드 레시피 (shell, virt-customize) |
 | [pickle-infra](https://github.com/PNUops/pickle-infra) (비공개) | 인프라 프로비저닝 스크립트와 운영 런북 (shell) |
 | [pickle-infra-example](https://github.com/PNUops/pickle-infra-example) | 프로비저닝·배포 스크립트와 런북 샘플 |
 | [pickle-secrets](https://github.com/PNUops/pickle-secrets) (비공개) | 호스트 시크릿 볼트 (git-crypt) |
 | [pickle-secrets-example](https://github.com/PNUops/pickle-secrets-example) | 볼트 레이아웃과 git-crypt 운용 절차 |
+<!-- arch:end -->
