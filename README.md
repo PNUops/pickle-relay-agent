@@ -20,7 +20,7 @@
 ## 주요 기능
 
 플랫폼은 VM 신청·승인·생성, SSH와 웹 터미널 접속, 도메인 공개, 만료와
-삭제까지를 다룹니다. 이 저장소가 맡는 부분은 아래와 같습니다.
+삭제까지를 다룹니다. 이 레포지토리가 맡는 부분은 아래와 같습니다.
 
 - **매핑 수렴**: 플랫폼이 정한 공인 포트에서 VM 포트로 가는 매핑을 릴레이 호스트의
   방화벽에 반영합니다.
@@ -102,7 +102,7 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 적용하지 않습니다.
 
 - **응답 파싱은 엄격합니다.** 모르는 필드가 있으면 스냅샷 전체를 거부합니다. 그래서
-  응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 계약 규칙입니다.
+  응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 명세 규칙입니다.
 - **counters는 기동 이후 누적값입니다.** 에이전트가 재시작하면 0부터 다시 시작하므로,
   서버는 값이 줄어든 것을 재시작으로 처리합니다.
 - **counters는 보고 한 건당 최대 2000행**입니다. 살아 있는 매핑이 그보다 많으면 보고가
@@ -183,10 +183,11 @@ Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 
 | `PICKLE_RELAY_NEW_CONN_RATE` / `_BURST` | | 매핑당 신규 연결 pps 상한과 버스트 (기본 200/400) |
 | `PICKLE_RELAY_PER_SOURCE_RATE` / `_BURST` | | 출발지 IP당 신규 연결 pps 상한과 버스트 (기본 50/100, rate `0`이면 끔) |
 
-배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둡니다. 이 저장소에는 없습니다.
+배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둡니다. 이 레포지토리에는 없습니다.
 
 ## 전체 아키텍처
 
+<!-- arch:begin — 레포지토리 공통 블록입니다. 손으로 고치지 마세요. -->
 ```mermaid
 flowchart LR
     subgraph ext [외부]
@@ -213,6 +214,7 @@ flowchart LR
         DB[(PostgreSQL)]
         PVE[Proxmox VE]
         VM[사용자 VM]
+        IB[pickle-image-builder]
     end
 
     B --> PN
@@ -239,16 +241,19 @@ flowchart LR
     A -->|도메인 설정| P
     P -.->|vhost 적용| VN
     PVE -.->|생성/제어| VM
+    IB -.->|템플릿 빌드| PVE
 ```
 
-| 저장소 | 역할 |
+| 레포지토리 | 역할 |
 |---|---|
 | [pickle-api](https://github.com/PNUops/pickle-api) | REST API와 프로비저닝 워커 (Spring Boot 4, Java 25, PostgreSQL 18, JobRunr) |
 | [pickle-console](https://github.com/PNUops/pickle-console) | 사용자·관리자 웹 콘솔 (React 19, TypeScript) |
 | [pickle-sshgw](https://github.com/PNUops/pickle-sshgw) | SSH 게이트웨이와 웹 터미널 브리지 (sshpiperd, Go) |
 | [pickle-proxy-agent](https://github.com/PNUops/pickle-proxy-agent) | nginx 리버스 프록시 제어 에이전트 (Go) |
 | [pickle-relay-agent](https://github.com/PNUops/pickle-relay-agent) | 오프캠퍼스 릴레이의 nftables DNAT 에이전트 (Go) |
+| [pickle-image-builder](https://github.com/PNUops/pickle-image-builder) | 사용자 VM OS 이미지 빌드 레시피 (shell, virt-customize) |
 | [pickle-infra](https://github.com/PNUops/pickle-infra) (비공개) | 인프라 프로비저닝 스크립트와 운영 런북 (shell) |
 | [pickle-infra-example](https://github.com/PNUops/pickle-infra-example) | 프로비저닝·배포 스크립트와 런북 샘플 |
 | [pickle-secrets](https://github.com/PNUops/pickle-secrets) (비공개) | 호스트 시크릿 볼트 (git-crypt) |
 | [pickle-secrets-example](https://github.com/PNUops/pickle-secrets-example) | 볼트 레이아웃과 git-crypt 운용 절차 |
+<!-- arch:end -->
