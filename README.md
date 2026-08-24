@@ -149,7 +149,7 @@ counter가 0으로 돌아가는 것은 에이전트가 누적으로 보정해 �
 
 ```
 scripts/build.sh        # dist/relay-agent (정적, CGO 없음)
-scripts/verify.sh       # shellcheck + gofmt/vet/build/test + 공개 위생 검사
+scripts/verify.sh       # shellcheck + gofmt/vet/build/test
 ```
 
 실행 모드는 둘입니다.
