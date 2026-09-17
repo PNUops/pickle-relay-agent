@@ -118,6 +118,7 @@ func Plan(s *snapshot.Snapshot) []Rule {
 			PublicPort:     m.PublicPort,
 			Target:         m.Target().As4(),
 			TargetPort:     m.TargetPort,
+			SourcePolicy:   m.SourcePolicy.Value(),
 			CtMax:          m.CtMax,
 			NewConnRate:    m.NewConnRate,
 			NewConnBurst:   m.NewConnBurst,

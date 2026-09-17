@@ -16,6 +16,7 @@ import (
 	"github.com/pnuops/pickle-relay-agent/internal/nftctl"
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
 	"github.com/pnuops/pickle-relay-agent/internal/source"
+	"github.com/pnuops/pickle-relay-agent/internal/sourcepolicy"
 	"github.com/pnuops/pickle-relay-agent/internal/version"
 )
 
@@ -173,6 +174,7 @@ func (a *Agent) cycle(ctx context.Context) bool {
 	// fresh values
 	a.foldCounters()
 	rep := source.Report{
+		Capabilities:      []string{sourcepolicy.Capability},
 		AppliedGeneration: a.appliedGeneration,
 		AgentVersion:      version.Version,
 		LastError:         a.lastErr,

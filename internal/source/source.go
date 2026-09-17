@@ -15,6 +15,8 @@ import (
 // holds and what it has seen. It doubles as the heartbeat — every sync
 // carries it, whether or not the desired state changed.
 type Report struct {
+	// Capabilities reports optional policy formats this binary can enforce.
+	Capabilities []string `json:"capabilities,omitempty"`
 	// AppliedGeneration is the last generation the kernel is KNOWN to hold
 	// (never advanced on a failed apply).
 	AppliedGeneration int64 `json:"appliedGeneration"`
