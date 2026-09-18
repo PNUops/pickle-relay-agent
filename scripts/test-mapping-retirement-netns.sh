@@ -11,7 +11,10 @@ self_mnt_inode=$(stat -Lc %i /proc/self/ns/mnt)
 [ "$#" -eq 2 ] || { echo 'usage: test-mapping-retirement-netns.sh NFT_TEST CONNTRACK_TEST' >&2; exit 2; }
 nft_test=$1
 conntrack_test=$2
-[ -x "$nft_test" ] && [ -x "$conntrack_test" ] || { echo 'test binaries must be executable' >&2; exit 1; }
+if [ ! -x "$nft_test" ] || [ ! -x "$conntrack_test" ]; then
+  echo 'test binaries must be executable' >&2
+  exit 1
+fi
 
 work=$(mktemp -d /tmp/relay-retirement-packet.XXXXXX)
 chmod 700 "$work"
@@ -81,7 +84,10 @@ PY
 ip netns exec guest8 python3 -u "$work/server.py" 192.0.2.8 53,54,56 "$work/guest8.jsonl" "$work/ready8" & server_pids+=("$!")
 ip netns exec guest9 python3 -u "$work/server.py" 192.0.2.9 55 "$work/guest9.jsonl" "$work/ready9" & server_pids+=("$!")
 for _ in $(seq 1 30); do [ -e "$work/ready8" ] && [ -e "$work/ready9" ] && break; sleep 0.1; done
-[ -e "$work/ready8" ] && [ -e "$work/ready9" ] || { echo 'UDP servers did not become ready' >&2; exit 1; }
+if [ ! -e "$work/ready8" ] || [ ! -e "$work/ready9" ]; then
+  echo 'UDP servers did not become ready' >&2
+  exit 1
+fi
 
 apply_phase(){ PICKLE_RELAY_KERNEL_TEST=1 PICKLE_RELAY_TEST_IFACE=pub0 PICKLE_RELAY_TEST_PHASE=$1 "$nft_test" -test.run '^TestIntegrationManagedApplyAndSemanticReadback$'; }
 send(){ ip netns exec client python3 "$work/send.py" "$1" "$2" "$3"; }
