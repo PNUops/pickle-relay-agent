@@ -31,6 +31,7 @@ import (
 	"github.com/google/nftables/expr"
 
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
+	"github.com/pnuops/pickle-relay-agent/internal/sourcepolicy"
 )
 
 // TableName is the one table this agent owns.
@@ -51,11 +52,12 @@ const (
 // from the netlink assembly so validation logic stays unit-testable without
 // a kernel.
 type Rule struct {
-	MappingID  int64
-	Proto      snapshot.Proto
-	PublicPort uint16
-	Target     [4]byte
-	TargetPort uint16
+	MappingID    int64
+	Proto        snapshot.Proto
+	PublicPort   uint16
+	Target       [4]byte
+	TargetPort   uint16
+	SourcePolicy *sourcepolicy.Policy
 
 	// Per-mapping guard overrides carried from the snapshot (nil keeps the
 	// agent default, explicit 0 disables — see effectiveGuards).
@@ -116,6 +118,7 @@ func Plan(s *snapshot.Snapshot) []Rule {
 			PublicPort:     m.PublicPort,
 			Target:         m.Target().As4(),
 			TargetPort:     m.TargetPort,
+			SourcePolicy:   m.SourcePolicy.Value(),
 			CtMax:          m.CtMax,
 			NewConnRate:    m.NewConnRate,
 			NewConnBurst:   m.NewConnBurst,
@@ -247,8 +250,8 @@ func Apply(iface string, rules []Rule, g Guards) error {
 	})
 	// The forward chain exists for COUNTING only (policy accept, no verdicts):
 	// per-mapping traffic volume is invisible to the nat chain (it sees each
-	// flow's first packet), so byte/packet meters live here. All filtering
-	// stays in the host's static table.
+	// flow's first packet), so byte/packet meters live here. New-flow source
+	// restrictions and guards remain in prerouting; the host owns other filtering.
 	fwd := conn.AddChain(&nftables.Chain{
 		Name:     fwdChainName,
 		Table:    table,
@@ -335,8 +338,9 @@ func ReadCounters() (map[int64]Counters, error) {
 // 0-disables-skip logic, override resolution) are unit-testable without a
 // kernel.
 //
-// Order within a mapping: per-source guard, then aggregate rate guard, then
-// connlimit guard, then DNAT. Per-source-first is deliberate — it keeps a
+// Order within a mapping: source allowlist, per-source guard, aggregate rate
+// guard, connlimit guard, then DNAT. The allowlist excludes denied sources
+// before they consume guard state. Per-source-first among guards keeps a
 // single flooding source from draining the aggregate token bucket, so other
 // clients of the same mapping still get through; when the per-source set is
 // full, new sources fall through to the aggregate guard (bounded either way).
@@ -351,6 +355,9 @@ func renderRules(iface string, rules []Rule, g Guards) [][]expr.Any {
 	for i := range rules {
 		r := &rules[i]
 		eff := effectiveGuards(r, g)
+		if acl := sourceDropExprs(iface, r); acl != nil {
+			out = append(out, acl)
+		}
 		if eff.PerSourceRate > 0 {
 			out = append(out, perSourceExprs(iface, r, eff.PerSourceRate, eff.PerSourceBurst))
 		}

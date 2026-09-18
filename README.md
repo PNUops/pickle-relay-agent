@@ -81,6 +81,22 @@ sync 응답 본문, `apply` 입력 파일, 보존 파일이 모두 같은 형태
 실패시키면서 어느 매핑 탓인지 알려주지 않으므로, 상한을 넘는 값은 매핑 id가 붙은
 검증 오류로 미리 되돌려 보냅니다.
 
+매핑별 출발지 정책은 선택 필드 `sourcePolicy`로 전달합니다.
+
+```json
+{ "sourcePolicy": { "allowedCidrs": ["198.51.100.0/24"] } }
+```
+
+필드를 생략하면 기존 접근 동작을 유지합니다. `{"allowedCidrs":[]}`는 신규 연결을 모두
+거부하고, 전체 공개는 `0.0.0.0/0`으로 명시합니다. canonical IPv4 네트워크 CIDR을 최대
+128개 받으며 `null`, 목록 누락, 중복·호스트 비트·IPv6·DNS 이름은 거부합니다. 교내
+프리셋은 플랫폼이 CIDR로 확장합니다. 잘못된 정책은 스냅샷 전체를 거부하므로 이전 규칙과
+적용 세대를 유지합니다. 보존·부팅 재적용에서도 정책의 생략과 빈 목록을 구분합니다.
+
+출발지 검사는 공인 ingress의 주소 변환과 남용 가드보다 먼저 실행합니다. NAT 흐름의 첫
+패킷에만 적용하므로 정책 변경으로 기존 conntrack을 비우거나 진행 중인 세션을 종료하지
+않습니다. IPv6 매핑을 생성하거나 IPv6 정책을 IPv4로 바꾸어 적용하지 않습니다.
+
 ## 동기화
 
 동기화는 단일 엔드포인트에 대한 HTTP 폴링입니다. 요청 하나가 보고와 조회를 겸합니다.
@@ -90,6 +106,7 @@ POST {PICKLE_RELAY_SYNC_URL}
 Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 
 { "appliedGeneration": 41, "agentVersion": "v1.2.0",
+  "capabilities": ["source-acl-v1"],
   "lastError":  [ { "mappingId": 101, "message": "..." } ],
   "counters":   [ { "mappingId": 101, "newConns": 12, "inPackets": 340, "inBytes": 51200,
                     "outPackets": 300, "outBytes": 48000,
@@ -100,6 +117,11 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 `{ "generation": 42, "mappings": [...] }` 전체 스냅샷이 내려옵니다. 매핑이 없는
 응답의 generation이 보고한 적용 세대와 다르면 프로토콜 위반으로 보고 아무것도
 적용하지 않습니다.
+
+`capabilities`는 이 에이전트가 지원하는 정책 형식입니다. 플랫폼은 `source-acl-v1`을
+보고한 에이전트에만 `sourcePolicy`를 보내야 합니다. capability 광고는 실제 외부 접속
+검증이나 특정 정책의 적용 완료를 뜻하지 않습니다. 정책 변경에는 기존 세대 증가와
+`appliedGeneration` 확인 절차를 사용합니다.
 
 - **응답 파싱은 엄격합니다.** 모르는 필드가 있으면 스냅샷 전체를 거부합니다. 그래서
   응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 명세 규칙입니다.
@@ -128,7 +150,7 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 출발지별 가드는 매핑마다 동적 셋(원소 60초 만료, 최대 4096 출발지)에 IP별 토큰
 버킷을 얹은 것으로, 한 출발지의 폭주가 매핑 전체의 버킷을 비워 다른 사용자까지
 막는 일을 줄입니다. 셋이 가득 차면 새 출발지는 매핑 전체 가드로 넘어갑니다. 규칙
-순서는 출발지별 → 전체 rate → `ct count` → DNAT입니다.
+순서는 출발지 정책 → 출발지별 rate → 전체 rate → `ct count` → DNAT입니다.
 
 매핑마다 이름 있는 counter 여섯 개(신규 연결, 방향별 트래픽 두 개, 가드별 드롭 세
 개)를 만들어 동기화 보고의 근거로 사용합니다. 트래픽 counter는 별도 forward 체인에

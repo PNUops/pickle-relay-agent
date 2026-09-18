@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/pnuops/pickle-relay-agent/internal/sourcepolicy"
 )
 
 // Proto is the transport protocol of a mapping.
@@ -26,11 +28,12 @@ const (
 
 // Mapping is one public-port → target DNAT entry.
 type Mapping struct {
-	ID         int64  `json:"id"`
-	Proto      Proto  `json:"proto"`
-	PublicPort uint16 `json:"publicPort"`
-	TargetAddr string `json:"targetAddr"`
-	TargetPort uint16 `json:"targetPort"`
+	ID           int64                 `json:"id"`
+	Proto        Proto                 `json:"proto"`
+	PublicPort   uint16                `json:"publicPort"`
+	TargetAddr   string                `json:"targetAddr"`
+	TargetPort   uint16                `json:"targetPort"`
+	SourcePolicy sourcepolicy.Optional `json:"sourcePolicy,omitzero"`
 
 	// Per-mapping guard overrides. nil (field omitted or null) keeps the
 	// agent's env default; an explicit 0 disables that guard for this
