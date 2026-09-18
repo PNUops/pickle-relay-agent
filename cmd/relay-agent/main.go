@@ -61,6 +61,9 @@ func run(log *slog.Logger) error {
 		if err != nil {
 			return err
 		}
+		if s.Retirements != nil {
+			return fmt.Errorf("apply: managed mapping retirement requires run mode and its durable ledger")
+		}
 		if err := nftctl.Apply(cfg.PublicIface, nftctl.Plan(s), cfg.Guards); err != nil {
 			return err
 		}

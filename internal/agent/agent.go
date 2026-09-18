@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/pnuops/pickle-relay-agent/internal/config"
+	"github.com/pnuops/pickle-relay-agent/internal/conntrackctl"
 	"github.com/pnuops/pickle-relay-agent/internal/nftctl"
+	"github.com/pnuops/pickle-relay-agent/internal/retirement"
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
 	"github.com/pnuops/pickle-relay-agent/internal/source"
 	"github.com/pnuops/pickle-relay-agent/internal/sourcepolicy"
@@ -35,6 +37,16 @@ type NFTKernel struct{}
 func (NFTKernel) Apply(iface string, rules []nftctl.Rule, g nftctl.Guards) error {
 	return nftctl.Apply(iface, rules, g)
 }
+
+func (NFTKernel) ApplyManaged(iface string, rules []nftctl.Rule, retirements []snapshot.Retirement, g nftctl.Guards) error {
+	return nftctl.ApplyManaged(iface, rules, retirements, g)
+}
+
+func (NFTKernel) VerifyManaged(iface string, rules []nftctl.Rule, retirements []snapshot.Retirement, g nftctl.Guards) error {
+	return nftctl.VerifyManaged(iface, rules, retirements, g)
+}
+func (NFTKernel) Quarantine(iface string) error  { return nftctl.ApplyQuarantine(iface) }
+func (NFTKernel) HasManagedState() (bool, error) { return nftctl.HasManagedState() }
 
 // Present implements Kernel.
 func (NFTKernel) Present() (bool, error) { return nftctl.Present() }
@@ -74,11 +86,22 @@ type Agent struct {
 	// desired-state change is guaranteed to come along and retry it, so the
 	// poll loop keeps re-attempting the boot converge until it succeeds.
 	bootFailed bool
+	ledger     *retirement.Ledger
+	conntrack  conntrackctl.Controller
+	ledgerLost bool
+}
+
+type managedKernel interface {
+	ApplyManaged(iface string, rules []nftctl.Rule, retirements []snapshot.Retirement, g nftctl.Guards) error
+	VerifyManaged(iface string, rules []nftctl.Rule, retirements []snapshot.Retirement, g nftctl.Guards) error
+	Quarantine(iface string) error
+	HasManagedState() (bool, error)
 }
 
 // New builds an agent.
 func New(cfg *config.Config, src source.Source, k Kernel, log *slog.Logger) *Agent {
-	return &Agent{cfg: cfg, src: src, kernel: k, log: log, counters: newCounterState()}
+	ledger, _ := retirement.New()
+	return &Agent{cfg: cfg, src: src, kernel: k, log: log, counters: newCounterState(), ledger: ledger, conntrack: conntrackctl.Netlink{}}
 }
 
 // BootReapply restores the persisted snapshot iff it is younger than the
@@ -96,12 +119,22 @@ func New(cfg *config.Config, src source.Source, k Kernel, log *slog.Logger) *Age
 func (a *Agent) BootReapply() error {
 	path := a.cfg.SnapshotPath()
 	s, err := snapshot.LoadPersisted(path, a.cfg.Limits, a.cfg.SnapshotMaxAge, time.Now())
+	if ledgerErr := a.loadLedger(s); ledgerErr != nil {
+		if a.ledgerLost {
+			a.ensureQuarantine()
+		} else if a.ledger != nil && a.ledger.Armed {
+			if applyErr := a.apply(nil); applyErr != nil {
+				ledgerErr = fmt.Errorf("%v; fail-closed ledger apply: %w", ledgerErr, applyErr)
+			}
+		}
+		return a.noteBootFailure(ledgerErr)
+	}
 	switch {
 	case err == nil:
 		// fold whatever a previous run's table counted before the replace
 		// zeroes it (traffic that happened is traffic to report)
 		a.foldCounters()
-		if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
+		if err := a.apply(s); err != nil {
 			return a.noteBootFailure(fmt.Errorf("boot re-apply: %w", err))
 		}
 		a.counters.MarkReset()
@@ -121,11 +154,127 @@ func (a *Agent) BootReapply() error {
 		_ = os.Remove(path)
 	}
 	a.foldCounters()
-	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
+	if err := a.apply(nil); err != nil {
 		return a.noteBootFailure(fmt.Errorf("boot empty apply: %w", err))
 	}
 	a.counters.MarkReset()
 	a.appliedGeneration, a.applied, a.lastApplied = 0, true, nil
+	return nil
+}
+
+func (a *Agent) loadLedger(persisted *snapshot.Snapshot) error {
+	ledger, err := retirement.Load(a.cfg.RetirementLedgerPath())
+	if errors.Is(err, os.ErrNotExist) {
+		if persisted != nil && persisted.Retirements != nil {
+			a.ledger = nil
+			a.ledgerLost = true
+			return errors.New("managed snapshot exists without retirement ledger")
+		}
+		if _, statErr := os.Stat(a.cfg.SnapshotPath()); statErr == nil {
+			data, readErr := os.ReadFile(a.cfg.SnapshotPath())
+			if readErr != nil {
+				a.ledger = nil
+				a.ledgerLost = true
+				return errors.New("persisted snapshot cannot prove legacy state")
+			}
+			raw, parseErr := snapshot.Parse(data, a.cfg.Limits)
+			if parseErr != nil || raw.Retirements != nil {
+				a.ledger = nil
+				a.ledgerLost = true
+				return errors.New("persisted snapshot cannot prove legacy state without ledger")
+			}
+		} else if !errors.Is(statErr, os.ErrNotExist) {
+			a.ledger = nil
+			a.ledgerLost = true
+			return errors.New("persisted snapshot state cannot be inspected")
+		}
+		k, ok := a.kernel.(managedKernel)
+		if !ok {
+			a.ledger = nil
+			a.ledgerLost = true
+			return errors.New("kernel cannot inspect managed state")
+		}
+		managed, inspectErr := k.HasManagedState()
+		if inspectErr != nil || managed {
+			a.ledger = nil
+			a.ledgerLost = true
+			return errors.New("kernel managed state exists or cannot be inspected without ledger")
+		}
+		ledger, err = retirement.New()
+		if err == nil {
+			err = ledger.Persist(a.cfg.RetirementLedgerPath())
+		}
+	}
+	if err != nil {
+		a.ledger = nil
+		a.ledgerLost = true
+		return fmt.Errorf("load retirement ledger: %w", err)
+	}
+	a.ledger = ledger
+	if persisted != nil {
+		if persisted.Retirements != nil && *persisted.AcknowledgedRetirementHighWater != ledger.AcknowledgedRetirementHighWater {
+			a.ledgerLost = true
+			return errors.New("persisted snapshot would compact retirement during boot")
+		}
+		next, prepErr := ledger.Prepare(persisted)
+		if prepErr != nil {
+			a.ledgerLost = true
+			return prepErr
+		}
+		a.ledger = next
+	}
+	return nil
+}
+
+func (a *Agent) ensureQuarantine() {
+	k, ok := a.kernel.(managedKernel)
+	if !ok {
+		a.log.Error("ledger-loss quarantine unavailable")
+		return
+	}
+	if err := k.Quarantine(a.cfg.PublicIface); err != nil {
+		a.log.Error("ledger-loss quarantine failed", "error", err)
+	}
+}
+
+func (a *Agent) apply(s *snapshot.Snapshot) error {
+	var rules []nftctl.Rule
+	if s != nil {
+		rules = nftctl.Plan(s)
+	}
+	retirements := a.ledger.Retirements()
+	if !a.ledger.Armed && len(retirements) == 0 {
+		return a.kernel.Apply(a.cfg.PublicIface, rules, a.cfg.Guards)
+	}
+	k, ok := a.kernel.(managedKernel)
+	if !ok {
+		return errors.New("kernel lacks mapping-retirement-v1")
+	}
+	if err := k.ApplyManaged(a.cfg.PublicIface, rules, retirements, a.cfg.Guards); err != nil {
+		return err
+	}
+	if err := k.VerifyManaged(a.cfg.PublicIface, rules, retirements, a.cfg.Guards); err != nil {
+		return fmt.Errorf("managed readback: %w", err)
+	}
+	cleared := map[string]bool{}
+	for _, entry := range a.ledger.Entries {
+		if entry.Cleared {
+			continue
+		}
+		if err := a.conntrack.Clear(entry.Retirement); err != nil {
+			return fmt.Errorf("conntrack retirement: %w", err)
+		}
+		cleared[entry.RetirementID] = true
+	}
+	a.ledger.Clear(cleared)
+	if err := a.ledger.Persist(a.cfg.RetirementLedgerPath()); err != nil {
+		for i := range a.ledger.Entries {
+			if cleared[a.ledger.Entries[i].RetirementID] {
+				a.ledger.Entries[i].Cleared = false
+			}
+		}
+		return err
+	}
 	return nil
 }
 
@@ -173,14 +322,36 @@ func (a *Agent) cycle(ctx context.Context) bool {
 	// read kernel counters first so even a no-change heartbeat reports
 	// fresh values
 	a.foldCounters()
+	capabilities := []string{sourcepolicy.Capability}
+	if !a.ledgerLost && a.ledger != nil {
+		capabilities = append(capabilities, retirement.Capability)
+	}
 	rep := source.Report{
-		Capabilities:      []string{sourcepolicy.Capability},
+		Capabilities:      capabilities,
 		AppliedGeneration: a.appliedGeneration,
 		AgentVersion:      version.Version,
 		LastError:         a.lastErr,
 		Counters:          a.counters.Snapshot(),
 	}
+	if a.ledger != nil {
+		rep.RetirementLedgerID = a.ledger.LedgerID
+		rep.MappingIDHighWater = a.ledger.MappingIDHighWater
+		rep.FlowMarkHighWater = a.ledger.FlowMarkHighWater
+		rep.RetirementHighWater = a.ledger.RetirementHighWater
+		rep.ManagedGenerationHighWater = a.ledger.ManagedGenerationHighWater
+		rep.RetirementReceipts = []source.RetirementReceipt{}
+		for _, entry := range a.ledger.ClearedEntries() {
+			rep.RetirementReceipts = append(rep.RetirementReceipts, source.RetirementReceipt{RetirementID: entry.RetirementID, Generation: entry.Generation, MappingID: entry.MappingID, FlowMark: entry.FlowMark, TupleHash: entry.TupleHash, State: "CLEARED"})
+		}
+	}
 	body, changed, err := a.src.Sync(ctx, rep)
+	if a.ledgerLost {
+		a.ensureQuarantine()
+		if err != nil {
+			a.log.Warn("sync failed during ledger-loss quarantine", "error", err)
+		}
+		return false
+	}
 	if err != nil {
 		// the POST itself was the report; nothing else to do until next tick
 		a.log.Warn("sync failed", "error", err)
@@ -212,7 +383,28 @@ func (a *Agent) cycle(ctx context.Context) bool {
 		a.setLastErr(err)
 		return false
 	}
-	if a.applied && s.Generation == a.appliedGeneration {
+	nextLedger, err := a.ledger.Prepare(s)
+	if err != nil {
+		a.log.Error("retirement snapshot rejected", "error", err)
+		a.setLastErr(err)
+		return false
+	}
+	for _, old := range a.ledger.Entries {
+		still := false
+		for _, entry := range nextLedger.Entries {
+			if entry.RetirementID == old.RetirementID {
+				still = true
+			}
+		}
+		if !still {
+			if err := a.conntrack.Zero(old.Retirement); err != nil {
+				a.setLastErr(err)
+				return false
+			}
+		}
+	}
+	ledgerChanged := nextLedger.DesiredHash != a.ledger.DesiredHash || nextLedger.ManagedGenerationHighWater != a.ledger.ManagedGenerationHighWater || nextLedger.Armed != a.ledger.Armed || nextLedger.MappingIDHighWater != a.ledger.MappingIDHighWater || nextLedger.FlowMarkHighWater != a.ledger.FlowMarkHighWater || nextLedger.RetirementHighWater != a.ledger.RetirementHighWater || nextLedger.AcknowledgedRetirementHighWater != a.ledger.AcknowledgedRetirementHighWater || len(nextLedger.Active) != len(a.ledger.Active) || len(nextLedger.Entries) != len(a.ledger.Entries)
+	if a.applied && s.Generation == a.appliedGeneration && !ledgerChanged {
 		// Generation unchanged — normally a no-op, but re-assert if the kernel
 		// table was wiped out of band (e.g. an `nft flush ruleset` or an
 		// nftables restart without the ExecStop drop-in): otherwise the
@@ -232,15 +424,31 @@ func (a *Agent) cycle(ctx context.Context) bool {
 	// every counter object at zero, so anything counted since the fold at
 	// the top of this cycle would otherwise be lost
 	a.foldCounters()
-	if err := a.kernel.Apply(a.cfg.PublicIface, nftctl.Plan(s), a.cfg.Guards); err != nil {
+	if nextLedger.Armed {
+		if err := nextLedger.Persist(a.cfg.RetirementLedgerPath()); err != nil {
+			a.setLastErr(err)
+			return false
+		}
+		a.ledger = nextLedger
+		if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
+			a.setLastErr(err)
+			return false
+		}
+	}
+	if !nextLedger.Armed {
+		a.ledger = nextLedger
+	}
+	if err := a.apply(s); err != nil {
 		a.log.Error("apply failed; generation frozen", "generation", s.Generation, "error", err)
 		a.setLastErr(err)
 		return false
 	}
-	a.counters.MarkReset()
-	if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
-		a.log.Warn("persist failed (kernel state is applied)", "error", err)
+	if !nextLedger.Armed {
+		if err := s.Persist(a.cfg.SnapshotPath()); err != nil {
+			a.log.Warn("persist failed (kernel state is applied)", "error", err)
+		}
 	}
+	a.counters.MarkReset()
 	advanced := !a.applied || s.Generation != a.appliedGeneration
 	a.appliedGeneration, a.applied, a.lastApplied = s.Generation, true, s
 	a.bootFailed, a.lastErr = false, nil
@@ -261,6 +469,10 @@ func (a *Agent) cycle(ctx context.Context) bool {
 // is re-applied at the SAME generation — no advance, no follow-up. A failed
 // re-apply is reported through lastError like any other apply failure.
 func (a *Agent) ensureAsserted() {
+	if a.ledgerLost {
+		a.ensureQuarantine()
+		return
+	}
 	if !a.applied {
 		if a.bootFailed {
 			a.retryBootConverge()
@@ -276,14 +488,15 @@ func (a *Agent) ensureAsserted() {
 	} else {
 		a.log.Warn("kernel table missing; re-asserting", "generation", a.appliedGeneration)
 	}
-	var (
-		rules []nftctl.Rule
-		n     int
-	)
+	n := 0
 	if a.lastApplied != nil {
-		rules, n = nftctl.Plan(a.lastApplied), len(a.lastApplied.Mappings)
+		n = len(a.lastApplied.Mappings)
 	}
-	if err := a.kernel.Apply(a.cfg.PublicIface, rules, a.cfg.Guards); err != nil {
+	var current *snapshot.Snapshot
+	if a.lastApplied != nil {
+		current = a.lastApplied
+	}
+	if err := a.apply(current); err != nil {
 		a.log.Error("re-assert failed", "generation", a.appliedGeneration, "error", err)
 		a.setLastErr(err)
 		return
@@ -301,7 +514,7 @@ func (a *Agent) ensureAsserted() {
 // reporting generation 0 and the retained error.
 func (a *Agent) retryBootConverge() {
 	a.foldCounters()
-	if err := a.kernel.Apply(a.cfg.PublicIface, nil, a.cfg.Guards); err != nil {
+	if err := a.apply(nil); err != nil {
 		a.log.Error("boot converge retry failed", "error", err)
 		a.setLastErr(err)
 		return

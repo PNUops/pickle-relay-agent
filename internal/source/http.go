@@ -63,8 +63,10 @@ func NewHTTP(url, token string) *HTTPSource {
 // path. DisallowUnknownFields stays deliberately strict; the recorded
 // contract rule is "agents upgrade before any sync-response field addition".
 type syncEnvelope struct {
-	Generation int64           `json:"generation"`
-	Mappings   json.RawMessage `json:"mappings"`
+	Generation                      int64           `json:"generation"`
+	Mappings                        json.RawMessage `json:"mappings"`
+	Retirements                     json.RawMessage `json:"retirements"`
+	AcknowledgedRetirementHighWater json.RawMessage `json:"acknowledgedRetirementHighWater"`
 }
 
 // Sync implements Source.
@@ -109,7 +111,7 @@ func (h *HTTPSource) Sync(ctx context.Context, r Report) ([]byte, bool, error) {
 	if dec.More() {
 		return nil, false, errors.New("sync: trailing data after response JSON")
 	}
-	if env.Mappings == nil {
+	if env.Mappings == nil && env.Retirements == nil {
 		// Tiny (unchanged) response: it must confirm the generation we
 		// reported as applied. Any other value with no mappings attached is
 		// a protocol violation — apply nothing.

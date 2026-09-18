@@ -53,6 +53,11 @@ type Config struct {
 // SnapshotPath returns the persisted snapshot location.
 func (c *Config) SnapshotPath() string { return filepath.Join(c.StateDir, "snapshot.json") }
 
+// RetirementLedgerPath returns the append-only burned-mark ledger location.
+func (c *Config) RetirementLedgerPath() string {
+	return filepath.Join(c.StateDir, "retirement-ledger.json")
+}
+
 // reservedRelayPorts are the relay's own service ports that a DNAT mapping
 // must never be allowed to shadow (admin sshd, WireGuard). SSH :22 is below the
 // 1024 floor already; these are the >=1024 cases the floor misses.

@@ -2,13 +2,17 @@ package agent
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/pnuops/pickle-relay-agent/internal/config"
 	"github.com/pnuops/pickle-relay-agent/internal/nftctl"
+	"github.com/pnuops/pickle-relay-agent/internal/retirement"
 	"github.com/pnuops/pickle-relay-agent/internal/snapshot"
 	"github.com/pnuops/pickle-relay-agent/internal/source"
 )
@@ -51,13 +55,36 @@ func (f *fakeSource) Sync(_ context.Context, r source.Report) ([]byte, bool, err
 // fakeKernel scripts counter readouts and apply outcomes, and records the
 // event order (the fold-before-replace property is an ordering claim).
 type fakeKernel struct {
-	events         []string
-	applyErrs      []error                     // popped per Apply call; empty → success
-	reads          []map[int64]nftctl.Counters // popped per ReadCounters call
-	presentResults []bool                      // popped per Present call; empty → true
-	lastRules      []nftctl.Rule
-	applyCalls     int
+	events          []string
+	applyErrs       []error                     // popped per Apply call; empty → success
+	reads           []map[int64]nftctl.Counters // popped per ReadCounters call
+	presentResults  []bool                      // popped per Present call; empty → true
+	lastRules       []nftctl.Rule
+	lastRetirements []snapshot.Retirement
+	verifyErr       error
+	quarantineCalls int
+	managedState    bool
+	managedStateErr error
+	applyCalls      int
 }
+type fakeConntrack struct {
+	clearErr, zeroErr error
+	clears, zeros     int
+}
+
+func (f *fakeConntrack) Clear(snapshot.Retirement) error { f.clears++; return f.clearErr }
+func (f *fakeConntrack) Zero(snapshot.Retirement) error  { f.zeros++; return f.zeroErr }
+
+func (k *fakeKernel) ApplyManaged(_ string, rules []nftctl.Rule, retirements []snapshot.Retirement, _ nftctl.Guards) error {
+	k.lastRetirements = retirements
+	return k.Apply("", rules, nftctl.Guards{})
+}
+
+func (k *fakeKernel) VerifyManaged(_ string, _ []nftctl.Rule, _ []snapshot.Retirement, _ nftctl.Guards) error {
+	return k.verifyErr
+}
+func (k *fakeKernel) Quarantine(string) error        { k.quarantineCalls++; return nil }
+func (k *fakeKernel) HasManagedState() (bool, error) { return k.managedState, k.managedStateErr }
 
 func (k *fakeKernel) Apply(_ string, rules []nftctl.Rule, _ nftctl.Guards) error {
 	k.events = append(k.events, "apply")
@@ -94,7 +121,9 @@ func (k *fakeKernel) ReadCounters() (map[int64]nftctl.Counters, error) {
 }
 
 func newTestAgent(t *testing.T, src *fakeSource, k *fakeKernel) *Agent {
-	return New(testConfig(t), src, k, slog.New(slog.DiscardHandler))
+	a := New(testConfig(t), src, k, slog.New(slog.DiscardHandler))
+	a.conntrack = &fakeConntrack{}
+	return a
 }
 
 const gen2Body = `{"generation":2,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80}]}`
@@ -124,6 +153,185 @@ func TestUnchangedCycleReportsCounters(t *testing.T) {
 	}
 	if k.applyCalls != 0 {
 		t.Fatalf("unchanged cycles must not apply (%d applies)", k.applyCalls)
+	}
+}
+
+func TestRetirementReceiptWaitsForKernelReadbackAndRetries(t *testing.T) {
+	hash := snapshot.TupleHash(7, snapshot.ProtoTCP, 10080, "192.0.2.8", 80, 10)
+	active := []byte(`{"generation":2,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`)
+	retired := []byte(fmt.Sprintf(`{"generation":3,"mappings":[],"retirements":[{"retirementId":"11111111-2222-4333-8444-555555555555","mappingId":7,"generation":3,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10,"tupleHash":"%s"}],"acknowledgedRetirementHighWater":0}`, hash))
+	src := &fakeSource{responses: []syncResp{{body: active, changed: true}, {body: retired, changed: true}, {body: retired, changed: true}, {body: retired, changed: true}, {changed: false}}}
+	k := &fakeKernel{}
+	a := newTestAgent(t, src, k)
+	if !a.cycle(context.Background()) || a.appliedGeneration != 2 {
+		t.Fatal("managed mapping did not apply")
+	}
+	k.verifyErr = errors.New("readback incomplete")
+	if a.cycle(context.Background()) || a.appliedGeneration != 2 {
+		t.Fatal("failed readback advanced generation")
+	}
+	if len(a.ledger.ClearedEntries()) != 0 {
+		t.Fatal("failed readback produced receipt")
+	}
+	k.verifyErr = nil
+	ct := a.conntrack.(*fakeConntrack)
+	ct.clearErr = errors.New("delete failed")
+	if a.cycle(context.Background()) || len(a.ledger.ClearedEntries()) != 0 {
+		t.Fatal("conntrack delete failure produced receipt")
+	}
+	ct.clearErr = nil
+	if !a.cycle(context.Background()) || a.appliedGeneration != 3 {
+		t.Fatal("retirement retry did not converge")
+	}
+	a.cycle(context.Background())
+	last := src.reports[len(src.reports)-1]
+	if len(last.RetirementReceipts) != 1 || last.RetirementReceipts[0].State != "CLEARED" {
+		t.Fatalf("receipts = %+v", last.RetirementReceipts)
+	}
+	ack := []byte(`{"generation":4,"mappings":[],"retirements":[],"acknowledgedRetirementHighWater":3}`)
+	src.responses = []syncResp{{body: ack, changed: true}, {body: ack, changed: true}}
+	ct.zeroErr = errors.New("late flow")
+	if a.cycle(context.Background()) || len(a.ledger.Entries) != 1 || len(k.lastRetirements) != 1 {
+		t.Fatal("late flow removed fence")
+	}
+	ct.zeroErr = nil
+	if !a.cycle(context.Background()) || len(a.ledger.Entries) != 0 {
+		t.Fatal("durably acknowledged retirement was not compacted")
+	}
+	if ct.zeros != 2 || len(k.lastRetirements) != 0 {
+		t.Fatal("fence removed without final zero proof")
+	}
+}
+
+func TestBootCrashBetweenLedgerAndManagedSnapshotConvergesEmpty(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SnapshotMaxAge = time.Hour
+	legacy, err := snapshot.Parse([]byte(gen2Body), cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := legacy.Persist(cfg.SnapshotPath()); err != nil {
+		t.Fatal(err)
+	}
+	ledger, _ := retirement.New()
+	managedBody := []byte(`{"generation":3,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`)
+	managed, err := snapshot.Parse(managedBody, cfg.Limits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger, err = ledger.Prepare(managed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ledger.Persist(cfg.RetirementLedgerPath()); err != nil {
+		t.Fatal(err)
+	}
+	k := &fakeKernel{}
+	src := &fakeSource{}
+	a := New(cfg, src, k, slog.New(slog.DiscardHandler))
+	if err := a.BootReapply(); err == nil {
+		t.Fatal("legacy snapshot accepted after ledger arm")
+	}
+	if len(k.lastRules) != 0 || a.applied || !a.ledgerLost || k.quarantineCalls != 1 {
+		t.Fatal("unmarked legacy mapping survived crash boundary")
+	}
+	a.cycle(context.Background())
+	if k.quarantineCalls != 2 || len(src.reports) != 1 || len(src.reports[0].Capabilities) != 1 || len(src.reports[0].LastError) == 0 {
+		t.Fatal("unchanged heartbeat escaped ledger-loss quarantine")
+	}
+}
+
+func TestMissingOrCorruptManagedLedgerQuarantinesExistingKernel(t *testing.T) {
+	for _, mode := range []string{"missing", "corrupt", "kernel-only"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := testConfig(t)
+			cfg.SnapshotMaxAge = time.Hour
+			k := &fakeKernel{}
+			if mode != "kernel-only" {
+				body := []byte(`{"generation":3,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`)
+				s, err := snapshot.Parse(body, cfg.Limits)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = s.Persist(cfg.SnapshotPath()); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				k.managedState = true
+			}
+			if mode == "corrupt" {
+				if err := os.WriteFile(cfg.RetirementLedgerPath(), []byte("not-json"), 0640); err != nil {
+					t.Fatal(err)
+				}
+			}
+			src := &fakeSource{}
+			a := New(cfg, src, k, slog.New(slog.DiscardHandler))
+			if err := a.BootReapply(); err == nil {
+				t.Fatal("ledger loss accepted")
+			}
+			if !a.ledgerLost || a.ledger != nil || k.quarantineCalls != 1 {
+				t.Fatal("ledger loss did not quarantine")
+			}
+			a.cycle(context.Background())
+			if k.quarantineCalls != 2 || len(src.reports[0].Capabilities) != 1 || len(src.reports[0].LastError) == 0 {
+				t.Fatal("ledger loss heartbeat weakened quarantine")
+			}
+		})
+	}
+}
+
+func TestBootRefusesAckCompactionWithoutFinalZero(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.SnapshotMaxAge = time.Hour
+	l, _ := retirement.New()
+	active, _ := snapshot.Parse([]byte(`{"generation":2,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`), cfg.Limits)
+	l, _ = l.Prepare(active)
+	h := snapshot.TupleHash(7, snapshot.ProtoTCP, 10080, "192.0.2.8", 80, 10)
+	retired, _ := snapshot.Parse([]byte(fmt.Sprintf(`{"generation":3,"mappings":[],"retirements":[{"retirementId":"11111111-2222-4333-8444-555555555555","mappingId":7,"generation":3,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10,"tupleHash":"%s"}],"acknowledgedRetirementHighWater":0}`, h)), cfg.Limits)
+	l, _ = l.Prepare(retired)
+	l.Clear(map[string]bool{"11111111-2222-4333-8444-555555555555": true})
+	if err := l.Persist(cfg.RetirementLedgerPath()); err != nil {
+		t.Fatal(err)
+	}
+	acked, _ := snapshot.Parse([]byte(`{"generation":4,"mappings":[],"retirements":[],"acknowledgedRetirementHighWater":3}`), cfg.Limits)
+	if err := acked.Persist(cfg.SnapshotPath()); err != nil {
+		t.Fatal(err)
+	}
+	k := &fakeKernel{}
+	a := New(cfg, &fakeSource{}, k, slog.New(slog.DiscardHandler))
+	a.conntrack = &fakeConntrack{}
+	if err := a.BootReapply(); err == nil {
+		t.Fatal("boot compacted fence without zero proof")
+	}
+	if !a.ledgerLost || a.ledger == nil || len(a.ledger.Entries) != 1 || !a.ledger.Entries[0].Cleared || k.quarantineCalls != 1 {
+		t.Fatal("boot did not preserve durable retirement while quarantining")
+	}
+}
+
+func TestLedgerPersistenceIsAdoptedWhenSnapshotPersistenceFails(t *testing.T) {
+	cfg := testConfig(t)
+	if err := os.Mkdir(cfg.SnapshotPath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"generation":2,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`)
+	src := &fakeSource{responses: []syncResp{{body: body, changed: true}}}
+	k := &fakeKernel{}
+	a := New(cfg, src, k, slog.New(slog.DiscardHandler))
+	a.conntrack = &fakeConntrack{}
+	if a.cycle(context.Background()) || a.appliedGeneration != 0 || k.applyCalls != 0 {
+		t.Fatal("snapshot persistence failure applied or acknowledged generation")
+	}
+	if a.ledger.ManagedGenerationHighWater != 2 || a.ledger.MappingIDHighWater != 7 {
+		t.Fatalf("in-memory ledger regressed: %+v", a.ledger)
+	}
+	durable, err := retirement.Load(cfg.RetirementLedgerPath())
+	if err != nil || durable.ManagedGenerationHighWater != 2 {
+		t.Fatalf("durable ledger = %+v, %v", durable, err)
+	}
+	older := []byte(`{"generation":1,"mappings":[{"id":7,"proto":"tcp","publicPort":10080,"targetAddr":"192.0.2.8","targetPort":80,"flowMark":10}],"retirements":[],"acknowledgedRetirementHighWater":0}`)
+	src.responses = []syncResp{{body: older, changed: true}}
+	if a.cycle(context.Background()) || k.applyCalls != 0 {
+		t.Fatal("older snapshot passed adopted durable HWM")
 	}
 }
 

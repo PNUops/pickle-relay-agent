@@ -21,7 +21,7 @@ func TestPolicyFlowsFromSyncToKernelPlanAndMalformedUpdateIsRejected(t *testing.
 	if a.cycle(context.Background()) || kernel.applyCalls != 1 || a.appliedGeneration != 2 {
 		t.Fatal("malformed policy replaced the current kernel plan")
 	}
-	if len(src.reports[0].Capabilities) != 1 || src.reports[0].Capabilities[0] != "source-acl-v1" {
+	if len(src.reports[0].Capabilities) != 2 || src.reports[0].Capabilities[0] != "source-acl-v1" || src.reports[0].Capabilities[1] != "mapping-retirement-v1" {
 		t.Fatal("capability absent from heartbeat")
 	}
 }
