@@ -13,6 +13,22 @@ import (
 // All fixture addresses are RFC 5737 documentation ranges.
 const changedBody = `{"generation":6,"mappings":[{"id":1,"proto":"tcp","publicPort":10000,"targetAddr":"192.0.2.1","targetPort":80}]}`
 
+func TestReportWithoutRetirementCapabilityOmitsLedgerIdentity(t *testing.T) {
+	data, err := json.Marshal(Report{Capabilities: []string{"source-acl-v1"}, RetirementLedgerID: "must-not-leak", MappingIDHighWater: 9, RetirementReceipts: []RetirementReceipt{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"retirementLedgerId", "mappingIdHighWater", "flowMarkHighWater", "retirementHighWater", "managedGenerationHighWater", "retirementReceipts"} {
+		if _, ok := fields[key]; ok {
+			t.Fatalf("%s leaked without capability", key)
+		}
+	}
+}
+
 func TestHTTPSyncRequestShape(t *testing.T) {
 	var gotReq *http.Request
 	var gotBody []byte
@@ -24,7 +40,10 @@ func TestHTTPSyncRequestShape(t *testing.T) {
 	defer srv.Close()
 
 	src := NewHTTP(srv.URL+"/internal/relays/1/sync", "tok123")
-	rep := Report{AppliedGeneration: 5, AgentVersion: "v1.2.3"}
+	rep := Report{AppliedGeneration: 5, AgentVersion: "v1.2.3",
+		Capabilities:       []string{"source-acl-v1", "mapping-retirement-v1"},
+		RetirementLedgerID: "11111111-2222-4333-8444-555555555555",
+		RetirementReceipts: []RetirementReceipt{}}
 	body, changed, err := src.Sync(context.Background(), rep)
 	if err != nil {
 		t.Fatal(err)
@@ -55,6 +74,13 @@ func TestHTTPSyncRequestShape(t *testing.T) {
 	}
 	if m["appliedGeneration"] != float64(5) || m["agentVersion"] != "v1.2.3" {
 		t.Fatalf("request body = %s", gotBody)
+	}
+	if m["retirementLedgerId"] != "11111111-2222-4333-8444-555555555555" ||
+		m["mappingIdHighWater"] != float64(0) || m["flowMarkHighWater"] != float64(0) || m["retirementHighWater"] != float64(0) || m["managedGenerationHighWater"] != float64(0) {
+		t.Fatalf("ledger handshake = %s", gotBody)
+	}
+	if receipts, ok := m["retirementReceipts"].([]any); !ok || len(receipts) != 0 {
+		t.Fatalf("retirementReceipts must be explicit []: %s", gotBody)
 	}
 	for _, k := range []string{"lastError", "counters"} {
 		if _, present := m[k]; present {

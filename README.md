@@ -106,7 +106,11 @@ POST {PICKLE_RELAY_SYNC_URL}
 Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 
 { "appliedGeneration": 41, "agentVersion": "v1.2.0",
-  "capabilities": ["source-acl-v1"],
+  "capabilities": ["source-acl-v1", "mapping-retirement-v1"],
+  "retirementLedgerId": "11111111-2222-4333-8444-555555555555",
+  "mappingIdHighWater": 101, "flowMarkHighWater": 42, "retirementHighWater": 41,
+  "managedGenerationHighWater": 41,
+  "retirementReceipts": [],
   "lastError":  [ { "mappingId": 101, "message": "..." } ],
   "counters":   [ { "mappingId": 101, "newConns": 12, "inPackets": 340, "inBytes": 51200,
                     "outPackets": 300, "outBytes": 48000,
@@ -114,7 +118,8 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 ```
 
 응답은 두 형태입니다. 변경이 없으면 `{ "generation": 41 }`만 내려오고, 바뀌었으면
-`{ "generation": 42, "mappings": [...] }` 전체 스냅샷이 내려옵니다. 매핑이 없는
+`{ "generation": 42, "mappings": [...] }` 전체 스냅샷이 내려옵니다. Managed 응답은
+`retirements`와 `acknowledgedRetirementHighWater`도 명시합니다. 매핑이 없는
 응답의 generation이 보고한 적용 세대와 다르면 프로토콜 위반으로 보고 아무것도
 적용하지 않습니다.
 
@@ -122,6 +127,42 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 보고한 에이전트에만 `sourcePolicy`를 보내야 합니다. capability 광고는 실제 외부 접속
 검증이나 특정 정책의 적용 완료를 뜻하지 않습니다. 정책 변경에는 기존 세대 증가와
 `appliedGeneration` 확인 절차를 사용합니다.
+
+`mapping-retirement-v1`은 새 managed mapping의 기존 conntrack 흐름을 안전하게 퇴역시키는
+형식입니다. 각 매핑은 재사용하지 않는 32-bit `flowMark`를 가지며, 첫 패킷을 DNAT하기 전에
+conntrack mark로 저장합니다. 매핑을 정지하거나 삭제한 스냅샷은 `retirements`에 UUID,
+mapping id, generation, 기존 proto/public port/target, mark와 tuple hash를 함께 보냅니다.
+에이전트는 DNAT를 제거하는 같은 원자적 table 교체에서 기존 흐름의 양방향을 mark와 원래
+tuple로 찾아 DROP fence를 설치합니다. 실제 규칙 readback 뒤 native ctnetlink로 mark, protocol,
+원래 public port와 변환된 target tuple이 모두 일치하는 conntrack만 삭제하고, 재조회 결과가
+0일 때만 `CLEARED` receipt를 보고합니다. 일반 출발지 정책이나 가드 수정은 이 삭제 경로를
+호출하지 않으며 기존 흐름과 mark를 유지합니다. 구현은
+[`github.com/ti-mo/conntrack` v0.6.0](https://pkg.go.dev/github.com/ti-mo/conntrack@v0.6.0)의
+exact-mark `DumpFilter`, full-flow `Delete` API를 사용합니다.
+규칙 readback은 `github.com/google/nftables`의 공식 commit `f9b52ed2ba65`을 고정합니다.
+최신 stable v0.3.0은 현재 Linux kernel이 1 byte로 반환하는 conntrack direction을 4 byte로
+decode해 readback이 실패하며, 이 commit은 marshal/decode를 모두 1 byte로 바로잡습니다.
+
+ledger UUID, mapping epoch/mark/retirement high-water, 현재 active identity와 아직 ACK되지 않은
+퇴역 tuple은 StateDirectory의 별도 원장에 원자적으로 저장합니다. API DB가 이전 시점으로
+복원되어도 high-water 이하의 예전 id나 mark를 다시 활성화하지 않습니다. API가 연속
+`acknowledgedRetirementHighWater`를 응답하고 fence 제거 직전 zero 재확인까지 성공한 tuple만
+원장과 kernel에서 정리합니다. 원장 교체·누락, high-water 역행, tuple 충돌, 동시에 대기 중인
+retirement 4,096개 초과는 fail-closed입니다. 한 번 managed identity가 arm된 릴레이는 이
+capability가 없는 바이너리로 되돌릴 수 없습니다.
+
+`retirement-ledger.json`이 손상되었거나 managed snapshot/kernel marker가 남은 채 ledger만
+사라지면 에이전트는 owned table의 DNAT를 비우고 기존 DNAT conntrack 전달을 양방향 차단한
+채 오류를 유지합니다. 기존 ledger identity를 복원해 재시작하기 전에는 정상 동기화로
+돌아가지 않습니다. ledger, snapshot, kernel marker가 모두 사라진 상태는 진짜 최초 기동과
+로컬에서 구분할 수 없습니다. 이때 armed API는 새 ledger identity를 자동 수락하지 않아야
+하며, 운영자가 cached DNAT를 별도로 fence·검사한 뒤에만 명시적으로 재등록할 수 있습니다.
+
+격리된 Linux network namespace acceptance는 실제 UDP DNAT 흐름 세 개를 만들어 exact
+retirement만 삭제하고 다른 mark와 다른 target의 conntrack ID가 유지되는지 확인합니다.
+같은 client 5-tuple을 새 epoch/mark로 재개한 패킷 전달과, source ACL 변경 뒤 기존 UDP
+흐름은 유지하면서 새 source port만 차단되는 것도 검증합니다. 이 검사는 실제 외부 IP,
+TCP 세션, 운영 relay, RTO를 증명하지 않으며 운영 활성화 전 별도 검증이 필요합니다.
 
 - **응답 파싱은 엄격합니다.** 모르는 필드가 있으면 스냅샷 전체를 거부합니다. 그래서
   응답에 필드를 추가하기 전에 에이전트를 먼저 업그레이드하는 것이 명세 규칙입니다.

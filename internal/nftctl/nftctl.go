@@ -21,8 +21,11 @@
 package nftctl
 
 import (
+	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"net/netip"
 	"strconv"
 	"strings"
 	"time"
@@ -58,6 +61,7 @@ type Rule struct {
 	Target       [4]byte
 	TargetPort   uint16
 	SourcePolicy *sourcepolicy.Policy
+	FlowMark     uint32
 
 	// Per-mapping guard overrides carried from the snapshot (nil keeps the
 	// agent default, explicit 0 disables — see effectiveGuards).
@@ -118,6 +122,7 @@ func Plan(s *snapshot.Snapshot) []Rule {
 			PublicPort:     m.PublicPort,
 			Target:         m.Target().As4(),
 			TargetPort:     m.TargetPort,
+			FlowMark:       valueOrZero(m.FlowMark),
 			SourcePolicy:   m.SourcePolicy.Value(),
 			CtMax:          m.CtMax,
 			NewConnRate:    m.NewConnRate,
@@ -127,6 +132,13 @@ func Plan(s *snapshot.Snapshot) []Rule {
 		})
 	}
 	return rules
+}
+
+func valueOrZero(value *uint32) uint32 {
+	if value == nil {
+		return 0
+	}
+	return *value
 }
 
 // Counters is one mapping's kernel counter readout, keyed by the six named
@@ -226,6 +238,11 @@ func Present() (bool, error) {
 // netlink batch. iface is the public interface DNAT binds to; g holds the
 // default guard values (per-mapping overrides in rules take precedence).
 func Apply(iface string, rules []Rule, g Guards) error {
+	return ApplyManaged(iface, rules, nil, g)
+}
+
+// ApplyManaged atomically replaces active mappings and durable retirement drops.
+func ApplyManaged(iface string, rules []Rule, retirements []snapshot.Retirement, g Guards) error {
 	conn, err := nftables.New()
 	if err != nil {
 		return fmt.Errorf("open netlink: %w", err)
@@ -275,17 +292,359 @@ func Apply(iface string, rules []Rule, g Guards) error {
 			}
 		}
 	}
+	activeIndex := 0
 	for _, exprs := range renderRules(iface, rules, g) {
-		conn.AddRule(&nftables.Rule{Table: table, Chain: nat, Exprs: exprs})
+		rule := &nftables.Rule{Table: table, Chain: nat, Exprs: exprs}
+		if _, ok := exprs[len(exprs)-1].(*expr.NAT); ok {
+			rule.UserData = []byte(activeTag(&rules[activeIndex]))
+			activeIndex++
+		}
+		conn.AddRule(rule)
 	}
 	for _, exprs := range renderForwardRules(iface, rules) {
 		conn.AddRule(&nftables.Rule{Table: table, Chain: fwd, Exprs: exprs})
+	}
+	for i := range retirements {
+		for _, direction := range []expr.MetaKey{expr.MetaKeyIIFNAME, expr.MetaKeyOIFNAME} {
+			conn.AddRule(&nftables.Rule{Table: table, Chain: fwd,
+				Exprs:    retirementDropExprs(iface, &retirements[i], direction),
+				UserData: []byte(retirementTag(&retirements[i], direction))})
+		}
 	}
 
 	if err := conn.Flush(); err != nil {
 		return fmt.Errorf("apply %d rules: %w", len(rules), err)
 	}
 	return nil
+}
+
+func ApplyQuarantine(iface string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return err
+	}
+	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: TableName}
+	conn.AddTable(table)
+	conn.DelTable(table)
+	conn.AddTable(table)
+	accept := nftables.ChainPolicyAccept
+	conn.AddChain(&nftables.Chain{Name: chainName, Table: table, Type: nftables.ChainTypeNAT, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityNATDest, Policy: &accept})
+	fwd := conn.AddChain(&nftables.Chain{Name: fwdChainName, Table: table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookForward, Priority: nftables.ChainPriorityFilter, Policy: &accept})
+	for _, d := range []expr.MetaKey{expr.MetaKeyIIFNAME, expr.MetaKeyOIFNAME} {
+		conn.AddRule(&nftables.Rule{Table: table, Chain: fwd, Exprs: quarantineDropExprs(iface, d), UserData: []byte(fmt.Sprintf("pickle-quarantine:%d", d))})
+	}
+	if err := conn.Flush(); err != nil {
+		return fmt.Errorf("apply quarantine: %w", err)
+	}
+	return VerifyQuarantine(iface)
+}
+
+func quarantineDropExprs(iface string, ifKey expr.MetaKey) []expr.Any {
+	mask := make([]byte, 4)
+	binary.NativeEndian.PutUint32(mask, ctStatusDNAT)
+	return []expr.Any{&expr.Meta{Key: ifKey, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(iface)}, &expr.Ct{Register: 1, Key: expr.CtKeySTATUS}, &expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: mask, Xor: make([]byte, 4)}, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)}, &expr.Verdict{Kind: expr.VerdictDrop}}
+}
+
+func VerifyQuarantine(iface string) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return err
+	}
+	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: TableName}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return err
+	}
+	nat, err := conn.GetRules(table, &nftables.Chain{Name: chainName, Table: table})
+	if err != nil {
+		return err
+	}
+	fwd, err := conn.GetRules(table, &nftables.Chain{Name: fwdChainName, Table: table})
+	if err != nil {
+		return err
+	}
+	sets, err := conn.GetSets(table)
+	if err != nil {
+		return err
+	}
+	if len(nat) != 0 || len(fwd) != 2 || len(sets) != 0 {
+		return errors.New("quarantine rule count differs")
+	}
+	if err := validateOwnedChains(chains); err != nil {
+		return err
+	}
+	for i, d := range []expr.MetaKey{expr.MetaKeyIIFNAME, expr.MetaKeyOIFNAME} {
+		tag := fmt.Sprintf("pickle-quarantine:%d", d)
+		if string(fwd[i].UserData) != tag || !managedExprsEqual(fwd[i].Exprs, quarantineDropExprs(iface, d)) {
+			return errors.New("quarantine semantic readback differs")
+		}
+	}
+	return nil
+}
+
+func HasManagedState() (bool, error) {
+	present, err := Present()
+	if err != nil || !present {
+		return false, err
+	}
+	conn, err := nftables.New()
+	if err != nil {
+		return false, err
+	}
+	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: TableName}
+	for _, chain := range []string{chainName, fwdChainName} {
+		rules, err := conn.GetRules(table, &nftables.Chain{Name: chain, Table: table})
+		if err != nil {
+			return false, err
+		}
+		for _, rule := range rules {
+			tag := string(rule.UserData)
+			if strings.HasPrefix(tag, "pickle-active:") || strings.HasPrefix(tag, "pickle-retired:") || strings.HasPrefix(tag, "pickle-quarantine:") {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func activeTag(rule *Rule) string {
+	hash := snapshot.TupleHash(rule.MappingID, rule.Proto, rule.PublicPort, netip.AddrFrom4(rule.Target).String(), rule.TargetPort, rule.FlowMark)
+	return fmt.Sprintf("pickle-active:%d:%s", rule.MappingID, hash)
+}
+func retirementTag(r *snapshot.Retirement, direction expr.MetaKey) string {
+	return fmt.Sprintf("pickle-retired:%s:%d", r.RetirementID, direction)
+}
+
+// VerifyManaged reads kernel rule metadata after apply and requires every managed rule.
+func VerifyManaged(iface string, rules []Rule, retirements []snapshot.Retirement, guards Guards) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return err
+	}
+	table := &nftables.Table{Family: nftables.TableFamilyIPv4, Name: TableName}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return fmt.Errorf("read back chains: %w", err)
+	}
+	natRules, err := conn.GetRules(table, &nftables.Chain{Name: chainName, Table: table})
+	if err != nil {
+		return fmt.Errorf("read back active rules: %w", err)
+	}
+	fwdRules, err := conn.GetRules(table, &nftables.Chain{Name: fwdChainName, Table: table})
+	if err != nil {
+		return fmt.Errorf("read back retirement rules: %w", err)
+	}
+	sets, err := conn.GetSets(table)
+	if err != nil {
+		return fmt.Errorf("read back managed sets: %w", err)
+	}
+	if err := validateManagedReadback(iface, rules, retirements, guards, chains, natRules, fwdRules, sets); err != nil {
+		return err
+	}
+	actual := map[string]bool{}
+	for _, rule := range append(natRules, fwdRules...) {
+		if len(rule.UserData) > 0 {
+			actual[string(rule.UserData)] = true
+		}
+	}
+	expected := map[string]bool{}
+	for i := range rules {
+		expected[activeTag(&rules[i])] = true
+		if !actual[activeTag(&rules[i])] {
+			return fmt.Errorf("active mapping %d missing from readback", rules[i].MappingID)
+		}
+	}
+	for i := range retirements {
+		for _, d := range []expr.MetaKey{expr.MetaKeyIIFNAME, expr.MetaKeyOIFNAME} {
+			tag := retirementTag(&retirements[i], d)
+			expected[tag] = true
+			if !actual[tag] {
+				return fmt.Errorf("retirement %s missing from readback", retirements[i].RetirementID)
+			}
+		}
+	}
+	for tag := range actual {
+		if (strings.HasPrefix(tag, "pickle-active:") || strings.HasPrefix(tag, "pickle-retired:")) && !expected[tag] {
+			return fmt.Errorf("unexpected managed rule %s", tag)
+		}
+	}
+	return nil
+}
+
+func validateManagedReadback(iface string, rules []Rule, retirements []snapshot.Retirement, guards Guards, chains []*nftables.Chain, natRules, fwdRules []*nftables.Rule, sets []*nftables.Set) error {
+	if err := validateOwnedChains(chains); err != nil {
+		return err
+	}
+	expectedNat := renderRules(iface, rules, guards)
+	expectedFwd := renderForwardRules(iface, rules)
+	for i := range retirements {
+		for _, d := range []expr.MetaKey{expr.MetaKeyIIFNAME, expr.MetaKeyOIFNAME} {
+			expectedFwd = append(expectedFwd, retirementDropExprs(iface, &retirements[i], d))
+		}
+	}
+	if len(natRules) != len(expectedNat) || len(fwdRules) != len(expectedFwd) {
+		return errors.New("managed rule count differs from desired state")
+	}
+	natTags := expectedNatTags(rules, guards)
+	fwdTags := make([]string, 2*len(rules), 2*len(rules)+2*len(retirements))
+	for i := range retirements {
+		fwdTags = append(fwdTags, retirementTag(&retirements[i], expr.MetaKeyIIFNAME), retirementTag(&retirements[i], expr.MetaKeyOIFNAME))
+	}
+	for i, want := range expectedNat {
+		if string(natRules[i].UserData) != natTags[i] || !managedExprsEqual(natRules[i].Exprs, want) {
+			return fmt.Errorf("managed nat rule %d differs from desired semantics or tag", i)
+		}
+	}
+	for i, want := range expectedFwd {
+		if string(fwdRules[i].UserData) != fwdTags[i] || !managedExprsEqual(fwdRules[i].Exprs, want) {
+			return fmt.Errorf("managed forward rule %d differs from desired semantics or tag", i)
+		}
+	}
+	expectedSets := map[string]*nftables.Set{}
+	for i := range rules {
+		if effectiveGuards(&rules[i], guards).PerSourceRate > 0 {
+			s := perSourceSet(nil, rules[i].MappingID)
+			expectedSets[s.Name] = s
+		}
+	}
+	if len(sets) != len(expectedSets) {
+		return errors.New("managed set count differs from desired state")
+	}
+	for _, got := range sets {
+		want, ok := expectedSets[got.Name]
+		if !ok || got.KeyType.Name != want.KeyType.Name || got.Dynamic != want.Dynamic || got.HasTimeout != want.HasTimeout || got.Timeout != want.Timeout || got.Size != want.Size {
+			return fmt.Errorf("managed set %s differs from desired state", got.Name)
+		}
+	}
+	return nil
+}
+
+func validateOwnedChains(chains []*nftables.Chain) error {
+	owned := []*nftables.Chain{}
+	for _, c := range chains {
+		if c.Table != nil && c.Table.Family == nftables.TableFamilyIPv4 && c.Table.Name == TableName {
+			owned = append(owned, c)
+		}
+	}
+	if len(owned) != 2 {
+		return fmt.Errorf("owned table has %d chains, want 2", len(owned))
+	}
+	want := func(name string, typ nftables.ChainType, hook nftables.ChainHook, priority nftables.ChainPriority) bool {
+		for _, c := range owned {
+			if c.Name == name && c.Type == typ && c.Hooknum != nil && *c.Hooknum == hook && c.Priority != nil && *c.Priority == priority && c.Policy != nil && *c.Policy == nftables.ChainPolicyAccept {
+				return true
+			}
+		}
+		return false
+	}
+	if !want(chainName, nftables.ChainTypeNAT, *nftables.ChainHookPrerouting, *nftables.ChainPriorityNATDest) || !want(fwdChainName, nftables.ChainTypeFilter, *nftables.ChainHookForward, *nftables.ChainPriorityFilter) {
+		return errors.New("managed chain hook or priority differs from desired state")
+	}
+	return nil
+}
+
+func expectedNatTags(rules []Rule, g Guards) []string {
+	out := []string{}
+	for i := range rules {
+		r := &rules[i]
+		eff := effectiveGuards(r, g)
+		if r.SourcePolicy != nil {
+			out = append(out, "")
+		}
+		if eff.PerSourceRate > 0 {
+			out = append(out, "")
+		}
+		if eff.NewConnRate > 0 {
+			out = append(out, "")
+		}
+		if eff.MaxConn > 0 {
+			out = append(out, "")
+		}
+		out = append(out, activeTag(r))
+	}
+	return out
+}
+
+func managedExprsEqual(got, want []expr.Any) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		switch w := want[i].(type) {
+		case *expr.Meta:
+			g, ok := got[i].(*expr.Meta)
+			if !ok || g.Key != w.Key || g.Register != w.Register || g.SourceRegister != w.SourceRegister {
+				return false
+			}
+		case *expr.Cmp:
+			g, ok := got[i].(*expr.Cmp)
+			if !ok || g.Op != w.Op || g.Register != w.Register || !bytes.Equal(g.Data, w.Data) {
+				return false
+			}
+		case *expr.Payload:
+			g, ok := got[i].(*expr.Payload)
+			if !ok || g.OperationType != w.OperationType || g.DestRegister != w.DestRegister || g.SourceRegister != w.SourceRegister || g.Base != w.Base || g.Offset != w.Offset || g.Len != w.Len || g.CsumType != w.CsumType || g.CsumOffset != w.CsumOffset || g.CsumFlags != w.CsumFlags {
+				return false
+			}
+		case *expr.Ct:
+			g, ok := got[i].(*expr.Ct)
+			if !ok || g.Register != w.Register || g.SourceRegister != w.SourceRegister || g.Key != w.Key || g.Direction != w.Direction || g.OptDirection != w.OptDirection {
+				return false
+			}
+		case *expr.Immediate:
+			g, ok := got[i].(*expr.Immediate)
+			if !ok || g.Register != w.Register || !bytes.Equal(g.Data, w.Data) {
+				return false
+			}
+		case *expr.Objref:
+			g, ok := got[i].(*expr.Objref)
+			if !ok || g.Type != w.Type || g.Name != w.Name {
+				return false
+			}
+		case *expr.NAT:
+			g, ok := got[i].(*expr.NAT)
+			if !ok {
+				return false
+			}
+			addrMaxOK := g.RegAddrMax == w.RegAddrMax || (w.RegAddrMax == 0 && g.RegAddrMax == w.RegAddrMin)
+			protoMaxOK := g.RegProtoMax == w.RegProtoMax || (w.RegProtoMax == 0 && g.RegProtoMax == w.RegProtoMin)
+			if g.Type != w.Type || g.Family != w.Family || g.RegAddrMin != w.RegAddrMin || !addrMaxOK || g.RegProtoMin != w.RegProtoMin || !protoMaxOK || g.Random != w.Random || g.FullyRandom != w.FullyRandom || g.Persistent != w.Persistent || g.Prefix != w.Prefix {
+				return false
+			}
+		case *expr.Bitwise:
+			g, ok := got[i].(*expr.Bitwise)
+			if !ok || g.SourceRegister != w.SourceRegister || g.DestRegister != w.DestRegister || g.Len != w.Len || !bytes.Equal(g.Mask, w.Mask) || !bytes.Equal(g.Xor, w.Xor) {
+				return false
+			}
+		case *expr.Verdict:
+			g, ok := got[i].(*expr.Verdict)
+			if !ok || g.Kind != w.Kind {
+				return false
+			}
+		case *expr.Counter:
+			if _, ok := got[i].(*expr.Counter); !ok {
+				return false
+			}
+		case *expr.Limit:
+			g, ok := got[i].(*expr.Limit)
+			if !ok || g.Type != w.Type || g.Rate != w.Rate || g.Over != w.Over || g.Unit != w.Unit || g.Burst != w.Burst {
+				return false
+			}
+		case *expr.Connlimit:
+			g, ok := got[i].(*expr.Connlimit)
+			if !ok || g.Count != w.Count || g.Flags != w.Flags {
+				return false
+			}
+		case *expr.Dynset:
+			g, ok := got[i].(*expr.Dynset)
+			if !ok || g.SrcRegKey != w.SrcRegKey || g.SrcRegData != w.SrcRegData || g.SetName != w.SetName || g.Operation != w.Operation || g.Timeout != w.Timeout || g.Invert != w.Invert || !managedExprsEqual(g.Exprs, w.Exprs) {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // ReadCounters reads every named counter in the agent's table and folds the
@@ -475,7 +834,13 @@ func perSourceExprs(iface string, r *Rule, rate uint64, burst uint32) []expr.Any
 func dnatExprs(iface string, r *Rule) []expr.Any {
 	dstPort := make([]byte, 2)
 	binary.BigEndian.PutUint16(dstPort, r.TargetPort)
-	return append(matchExprs(iface, r),
+	out := matchExprs(iface, r)
+	if r.FlowMark != 0 {
+		mark := make([]byte, 4)
+		binary.NativeEndian.PutUint32(mark, r.FlowMark)
+		out = append(out, &expr.Immediate{Register: 1, Data: mark}, &expr.Ct{Register: 1, SourceRegister: true, Key: expr.CtKeyMARK})
+	}
+	return append(out,
 		// per-mapping counter. NOTE: this rule is in a nat chain, so it counts
 		// each flow's FIRST packet only — a new-connection counter, NOT a byte
 		// meter (its byte total reads ~0 regardless of volume). Byte metering
@@ -491,6 +856,27 @@ func dnatExprs(iface string, r *Rule) []expr.Any {
 			RegProtoMin: 2,
 		},
 	)
+}
+
+func retirementDropExprs(iface string, r *snapshot.Retirement, ifKey expr.MetaKey) []expr.Any {
+	proto := byte(protoTCP)
+	if r.Proto == snapshot.ProtoUDP {
+		proto = protoUDP
+	}
+	port := make([]byte, 2)
+	binary.BigEndian.PutUint16(port, r.PublicPort)
+	mark := make([]byte, 4)
+	binary.NativeEndian.PutUint32(mark, r.FlowMark)
+	dnatMask := make([]byte, 4)
+	binary.NativeEndian.PutUint32(dnatMask, ctStatusDNAT)
+	return []expr.Any{
+		&expr.Meta{Key: ifKey, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifname(iface)},
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
+		&expr.Ct{Register: 1, Key: expr.CtKeyMARK}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: mark},
+		&expr.Ct{Register: 1, Key: expr.CtKeyPROTODST, Direction: ctDirOriginal}, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: port},
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS}, &expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: dnatMask, Xor: make([]byte, 4)}, &expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: make([]byte, 4)},
+		&expr.Verdict{Kind: expr.VerdictDrop},
+	}
 }
 
 // renderForwardRules produces the two counting rules per mapping in the

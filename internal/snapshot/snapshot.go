@@ -7,12 +7,17 @@ package snapshot
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/pnuops/pickle-relay-agent/internal/sourcepolicy"
@@ -34,6 +39,7 @@ type Mapping struct {
 	TargetAddr   string                `json:"targetAddr"`
 	TargetPort   uint16                `json:"targetPort"`
 	SourcePolicy sourcepolicy.Optional `json:"sourcePolicy,omitzero"`
+	FlowMark     *uint32               `json:"flowMark,omitempty"`
 
 	// Per-mapping guard overrides. nil (field omitted or null) keeps the
 	// agent's env default; an explicit 0 disables that guard for this
@@ -57,11 +63,57 @@ func (m *Mapping) Target() netip.Addr { return m.target }
 
 // Snapshot is the full desired mapping set at one generation.
 type Snapshot struct {
-	Generation int64     `json:"generation"`
-	Mappings   []Mapping `json:"mappings"`
+	Generation                      int64         `json:"generation"`
+	Mappings                        []Mapping     `json:"mappings"`
+	Retirements                     *[]Retirement `json:"retirements,omitempty"`
+	AcknowledgedRetirementHighWater *int64        `json:"acknowledgedRetirementHighWater,omitempty"`
 
 	// PersistedAt is set only on the on-disk copy (bounded fail-open check).
 	PersistedAt time.Time `json:"persistedAt,omitzero"`
+}
+
+// Retirement permanently blocks conntrack flows created by a removed mapping.
+type Retirement struct {
+	RetirementID string `json:"retirementId"`
+	MappingID    int64  `json:"mappingId"`
+	Generation   int64  `json:"generation"`
+	Proto        Proto  `json:"proto"`
+	PublicPort   uint16 `json:"publicPort"`
+	TargetAddr   string `json:"targetAddr"`
+	TargetPort   uint16 `json:"targetPort"`
+	FlowMark     uint32 `json:"flowMark"`
+	TupleHash    string `json:"tupleHash"`
+}
+
+const MaxRetirements = 4096
+
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`)
+
+// TupleHash binds a durable mark to the exact mapping tuple.
+func TupleHash(mappingID int64, proto Proto, publicPort uint16, targetAddr string, targetPort uint16, flowMark uint32) string {
+	value := strconv.FormatInt(mappingID, 10) + "\n" + string(proto) + "\n" +
+		strconv.FormatUint(uint64(publicPort), 10) + "\n" + targetAddr + "\n" +
+		strconv.FormatUint(uint64(targetPort), 10) + "\n" + strconv.FormatUint(uint64(flowMark), 10) + "\n"
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+}
+
+func (s *Snapshot) DesiredHash() string {
+	cp := *s
+	cp.PersistedAt = time.Time{}
+	cp.Mappings = append([]Mapping(nil), s.Mappings...)
+	sort.Slice(cp.Mappings, func(i, j int) bool { return cp.Mappings[i].ID < cp.Mappings[j].ID })
+	if s.Retirements != nil {
+		rs := append([]Retirement(nil), (*s.Retirements)...)
+		sort.Slice(rs, func(i, j int) bool {
+			if rs[i].Generation != rs[j].Generation {
+				return rs[i].Generation < rs[j].Generation
+			}
+			return rs[i].RetirementID < rs[j].RetirementID
+		})
+		cp.Retirements = &rs
+	}
+	data, _ := json.Marshal(&cp)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
 
 // Limits are the validation bounds. Both come from configuration — the agent
@@ -139,6 +191,14 @@ func (s *Snapshot) Validate(lim Limits) error {
 	}
 	seen := make(map[[2]any]struct{}, len(s.Mappings))
 	seenID := make(map[int64]struct{}, len(s.Mappings))
+	seenMark := make(map[uint32]struct{}, len(s.Mappings))
+	managed := s.Retirements != nil
+	if managed && (s.AcknowledgedRetirementHighWater == nil || *s.AcknowledgedRetirementHighWater < 0) {
+		return errors.New("managed snapshot requires acknowledgedRetirementHighWater")
+	}
+	if !managed && s.AcknowledgedRetirementHighWater != nil {
+		return errors.New("acknowledgedRetirementHighWater requires retirements")
+	}
 	for i := range s.Mappings {
 		m := &s.Mappings[i]
 		// The id is the key of every per-mapping kernel object name (the six
@@ -155,6 +215,17 @@ func (s *Snapshot) Validate(lim Limits) error {
 			return mappingErr(m.ID, "duplicate mapping id")
 		}
 		seenID[m.ID] = struct{}{}
+		if managed {
+			if m.FlowMark == nil || *m.FlowMark == 0 {
+				return mappingErr(m.ID, "managed mapping requires a non-zero flowMark")
+			}
+			if _, dup := seenMark[*m.FlowMark]; dup {
+				return mappingErr(m.ID, "duplicate flowMark %d", *m.FlowMark)
+			}
+			seenMark[*m.FlowMark] = struct{}{}
+		} else if m.FlowMark != nil {
+			return mappingErr(m.ID, "flowMark requires an explicit retirements array")
+		}
 		if m.Proto != ProtoTCP && m.Proto != ProtoUDP {
 			return mappingErr(m.ID, "unknown proto %q", m.Proto)
 		}
@@ -207,6 +278,45 @@ func (s *Snapshot) Validate(lim Limits) error {
 		seen[key] = struct{}{}
 		m.target = addr
 	}
+	if managed {
+		if len(*s.Retirements) > MaxRetirements {
+			return fmt.Errorf("%d retirements exceeds cap %d", len(*s.Retirements), MaxRetirements)
+		}
+		seenRetirement := make(map[string]struct{}, len(*s.Retirements))
+		for i := range *s.Retirements {
+			r := &(*s.Retirements)[i]
+			if !uuidPattern.MatchString(strings.ToLower(r.RetirementID)) || r.RetirementID != strings.ToLower(r.RetirementID) {
+				return fmt.Errorf("retirement %q has invalid UUID", r.RetirementID)
+			}
+			if _, dup := seenRetirement[r.RetirementID]; dup {
+				return fmt.Errorf("duplicate retirementId %s", r.RetirementID)
+			}
+			seenRetirement[r.RetirementID] = struct{}{}
+			if r.MappingID <= 0 || r.Generation <= 0 || r.Generation > s.Generation || r.FlowMark == 0 {
+				return fmt.Errorf("retirement %s has invalid identity", r.RetirementID)
+			}
+			if _, active := seenID[r.MappingID]; active {
+				return fmt.Errorf("retired mapping %d is active", r.MappingID)
+			}
+			if _, dup := seenMark[r.FlowMark]; dup {
+				return fmt.Errorf("retirement %s reuses flowMark %d", r.RetirementID, r.FlowMark)
+			}
+			seenMark[r.FlowMark] = struct{}{}
+			if r.Proto != ProtoTCP && r.Proto != ProtoUDP {
+				return fmt.Errorf("retirement %s has unknown proto", r.RetirementID)
+			}
+			if r.PublicPort < lim.BandMin || r.PublicPort > lim.BandMax || r.TargetPort == 0 {
+				return fmt.Errorf("retirement %s has invalid ports", r.RetirementID)
+			}
+			addr, err := netip.ParseAddr(r.TargetAddr)
+			if err != nil || !addr.Is4() || addr.String() != r.TargetAddr {
+				return fmt.Errorf("retirement %s has non-canonical IPv4 target", r.RetirementID)
+			}
+			if TupleHash(r.MappingID, r.Proto, r.PublicPort, r.TargetAddr, r.TargetPort, r.FlowMark) != r.TupleHash {
+				return fmt.Errorf("retirement %s tupleHash mismatch", r.RetirementID)
+			}
+		}
+	}
 	return nil
 }
 
@@ -218,6 +328,22 @@ func Parse(data []byte, lim Limits) (*Snapshot, error) {
 	// explicit `{"generation":N,"mappings":[]}` form.
 	if bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return nil, errors.New("snapshot body is null")
+	}
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(data, &shape); err == nil {
+		if raw, ok := shape["retirements"]; ok && bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			return nil, errors.New("retirements must be an explicit array")
+		}
+		if raw, ok := shape["mappings"]; ok {
+			var mappings []map[string]json.RawMessage
+			if json.Unmarshal(raw, &mappings) == nil {
+				for _, mapping := range mappings {
+					if mark, present := mapping["flowMark"]; present && bytes.Equal(bytes.TrimSpace(mark), []byte("null")) {
+						return nil, errors.New("flowMark must be a non-zero unsigned integer")
+					}
+				}
+			}
+		}
 	}
 	var s Snapshot
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -264,7 +390,15 @@ func (s *Snapshot) Persist(path string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	directory, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 // ErrStale marks a persisted snapshot older than the allowed window.

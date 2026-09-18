@@ -8,8 +8,34 @@ package source
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 )
+
+func (r Report) MarshalJSON() ([]byte, error) {
+	type plain Report
+	data, err := json.Marshal(plain(r))
+	if err != nil {
+		return nil, err
+	}
+	managed := false
+	for _, capability := range r.Capabilities {
+		if capability == "mapping-retirement-v1" {
+			managed = true
+		}
+	}
+	if managed {
+		return data, nil
+	}
+	var fields map[string]json.RawMessage
+	if err = json.Unmarshal(data, &fields); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"retirementLedgerId", "mappingIdHighWater", "flowMarkHighWater", "retirementHighWater", "managedGenerationHighWater", "retirementReceipts"} {
+		delete(fields, key)
+	}
+	return json.Marshal(fields)
+}
 
 // Report is the agent's side of a sync exchange: what the kernel currently
 // holds and what it has seen. It doubles as the heartbeat — every sync
@@ -27,7 +53,22 @@ type Report struct {
 	LastError []ErrItem `json:"lastError,omitempty"`
 	// Counters are the per-mapping traffic/drop totals, cumulative since
 	// agent start (the server treats any decrease as an agent restart).
-	Counters []MappingCounters `json:"counters,omitempty"`
+	Counters                   []MappingCounters   `json:"counters,omitempty"`
+	RetirementLedgerID         string              `json:"retirementLedgerId"`
+	MappingIDHighWater         int64               `json:"mappingIdHighWater"`
+	FlowMarkHighWater          uint32              `json:"flowMarkHighWater"`
+	RetirementHighWater        int64               `json:"retirementHighWater"`
+	ManagedGenerationHighWater int64               `json:"managedGenerationHighWater"`
+	RetirementReceipts         []RetirementReceipt `json:"retirementReceipts"`
+}
+
+type RetirementReceipt struct {
+	RetirementID string `json:"retirementId"`
+	Generation   int64  `json:"generation"`
+	MappingID    int64  `json:"mappingId"`
+	FlowMark     uint32 `json:"flowMark"`
+	TupleHash    string `json:"tupleHash"`
+	State        string `json:"state"`
 }
 
 // ErrItem is one apply/validation failure. MappingID is set when the failure
