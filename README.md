@@ -128,6 +128,11 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 검증이나 특정 정책의 적용 완료를 뜻하지 않습니다. 정책 변경에는 기존 세대 증가와
 `appliedGeneration` 확인 절차를 사용합니다.
 
+릴레이 쪽에는 출발지 정책을 따로 켜는 환경 변수가 없습니다. 이 바이너리를 배포하면 매
+동기화 요청이 capability를 보고합니다. 플랫폼 producer는 저장된 과거 값이 아니라 현재
+heartbeat에서 그 값을 확인한 뒤 활성화합니다. 기존 공인 interface, target CIDR과 sync
+자격증명이 준비 조건이며, capability 확인 뒤에도 외부 source의 허용·거부를 따로 검증합니다.
+
 `mapping-retirement-v1`은 새 managed mapping의 기존 conntrack 흐름을 안전하게 퇴역시키는
 형식입니다. 각 매핑은 재사용하지 않는 32-bit `flowMark`를 가지며, 첫 패킷을 DNAT하기 전에
 conntrack mark로 저장합니다. 매핑을 정지하거나 삭제한 스냅샷은 `retirements`에 UUID,
@@ -225,7 +230,8 @@ relay-agent run                         # 부팅 재적용 → 폴링 루프
 규칙 생성과 커널 커밋이 나뉘어 있어, 스냅샷에서 만들어지는 규칙 자체는 실제 커널 없이
 검증합니다.
 
-Go 1.26이 필요하고 직접 의존성은 `github.com/google/nftables` v0.3.0 하나입니다.
+Go 1.26이 필요합니다. 직접 의존성은 `github.com/google/nftables`
+`v0.3.1-0.20260430172505-f9b52ed2ba65`와 `github.com/ti-mo/conntrack` `v0.6.0`입니다.
 `scripts/systemd/relay-agent.service`는 전용 사용자 `pickle-relay`에
 `AmbientCapabilities=CAP_NET_ADMIN`만 부여합니다.
 
