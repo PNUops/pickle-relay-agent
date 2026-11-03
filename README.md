@@ -18,7 +18,7 @@
 
 ## 주요 기능
 
-플랫폼은 VM 신청·승인·생성, SSH와 웹 터미널 접속, 도메인 공개, 만료와
+플랫폼은 VM 신청과 승인, 생성, SSH와 웹 터미널 접속, 도메인 공개, 만료와
 삭제까지를 다뤄요. 이 레포지토리가 맡는 부분은 아래와 같아요.
 
 - **매핑 수렴**: 플랫폼이 정한 공인 포트에서 VM 포트로 가는 매핑을 릴레이 호스트의
@@ -26,7 +26,7 @@
 - **남용 가드**: 매핑마다 동시 연결 수와 신규 연결 속도에 상한을 두어, 한 매핑에 몰린
   트래픽이 다른 접속 경로를 밀어내지 못하게 해요.
 - **오래된 상태 폐기**: 보존한 스냅샷이 허용 창을 넘기면 버리고 빈 집합으로 수렴해요.
-- **사용량 보고** — 매핑별 연결 수와 트래픽, 가드가 막은 횟수를 집계해 플랫폼에 보고해요.
+- **사용량 보고**: 매핑별 연결 수와 트래픽, 가드가 막은 횟수를 집계해 플랫폼에 보고해요.
 - **부팅 복구**: 릴레이가 재시작해도 마지막 상태를 다시 적용해 매핑이 살아나요.
 
 ## 동작 방식
@@ -42,7 +42,7 @@
   재적용해요. 허용 창을 넘겼으면 폐기하고 빈 집합으로 수렴해요. 허용 창은 플랫폼의 IP 격리
   창과 같은 값으로 둬요. 부팅 재적용이 실패하면 종료하지 않고 폴링 루프로 들어가요.
   세대는 0으로 보고하고, 주기마다 빈 집합 수렴을 다시 시도해요.
-- **netlink 직접 호출** — `nft(8)`를 실행하지 않아 자식 프로세스가 없고, systemd
+- **netlink 직접 호출**: `nft(8)`를 실행하지 않아 자식 프로세스가 없고, systemd
   유닛이 `SystemCallFilter=@system-service`와 `MemoryDenyWriteExecute=yes`를 켠 채
   돌아가요. exec 헬퍼를 추가한다면 이 하드닝 블록부터 다시 봐야 해요.
 - **방화벽을 결정하는 값에는 기본값이 없어요.** 대상 CIDR, 공인 대역, 인터페이스,
@@ -80,9 +80,9 @@ sync 응답 본문, `apply` 입력 파일, 보존 파일이 모두 같은 형태
 
 필드를 생략하면 기존 접근 동작을 유지해요. `{"allowedCidrs":[]}`는 신규 연결을 모두
 거부하고, 전체 공개는 `0.0.0.0/0`으로 명시해요. canonical IPv4 네트워크 CIDR을 최대
-128개 받으며 `null`, 목록 누락, 중복·호스트 비트·IPv6·DNS 이름은 거부해요. 교내
+128개 받으며 `null`, 목록 누락, 중복과 호스트 비트, IPv6, DNS 이름은 거부해요. 교내
 프리셋은 플랫폼이 CIDR로 확장해요. 잘못된 정책은 스냅샷 전체를 거부하므로 이전 규칙과
-적용 세대를 유지해요. 보존·부팅 재적용에서도 정책의 생략과 빈 목록을 구분해요.
+적용 세대를 유지해요. 보존과 부팅 재적용에서도 정책의 생략과 빈 목록을 구분해요.
 
 출발지 검사는 공인 ingress의 주소 변환과 남용 가드보다 먼저 실행해요. NAT 흐름의 첫
 패킷에만 적용하므로 정책 변경으로 기존 conntrack을 비우거나 진행 중인 세션을 종료하지
@@ -122,7 +122,7 @@ Authorization: Bearer {PICKLE_RELAY_SYNC_TOKEN}
 릴레이 쪽에는 출발지 정책을 따로 켜는 환경 변수가 없어요. 이 바이너리를 배포하면 매
 동기화 요청이 capability를 보고해요. 플랫폼 producer는 저장된 과거 값이 아니라 현재
 heartbeat에서 그 값을 확인한 뒤 활성화해요. 기존 공인 interface, target CIDR과 sync
-자격증명이 준비 조건이며, capability 확인 뒤에도 외부 source의 허용·거부를 따로 검증해요.
+자격증명이 준비 조건이며, capability 확인 뒤에도 외부 source의 허용과 거부를 따로 검증해요.
 
 `mapping-retirement-v1`은 새 managed mapping의 기존 conntrack 흐름을 안전하게 퇴역시키는
 형식이에요. 각 매핑은 재사용하지 않는 32-bit `flowMark`를 가지며, 첫 패킷을 DNAT하기 전에
@@ -143,7 +143,7 @@ ledger UUID, mapping epoch/mark/retirement high-water, 현재 active identity와
 퇴역 tuple은 StateDirectory의 별도 원장에 원자적으로 저장해요. API DB가 이전 시점으로
 복원되어도 high-water 이하의 예전 id나 mark를 다시 활성화하지 않아요. API가 연속
 `acknowledgedRetirementHighWater`를 응답하고 fence 제거 직전 zero 재확인까지 성공한 tuple만
-원장과 kernel에서 정리해요. 원장 교체·누락, high-water 역행, tuple 충돌, 동시에 대기 중인
+원장과 kernel에서 정리해요. 원장 교체나 누락, high-water 역행, tuple 충돌, 동시에 대기 중인
 retirement 4,096개 초과는 fail-closed로 처리해요. 한 번 managed identity가 arm된 릴레이는 이
 capability가 없는 바이너리로 되돌릴 수 없어요.
 
@@ -152,7 +152,7 @@ capability가 없는 바이너리로 되돌릴 수 없어요.
 채 오류를 유지해요. 기존 ledger identity를 복원해 재시작하기 전에는 정상 동기화로
 돌아가지 않아요. ledger, snapshot, kernel marker가 모두 사라진 상태는 진짜 최초 기동과
 로컬에서 구분할 수 없어요. 이때 armed API는 새 ledger identity를 자동 수락하지 않아야
-하며, 운영자가 cached DNAT를 별도로 fence·검사한 뒤에만 명시적으로 재등록할 수 있어요.
+하며, 운영자가 cached DNAT를 별도로 fence하고 검사한 뒤에만 명시적으로 재등록할 수 있어요.
 
 격리된 Linux network namespace acceptance는 실제 UDP DNAT 흐름 세 개를 만들어 exact
 retirement만 삭제하고 다른 mark와 다른 target의 conntrack ID가 유지되는지 확인해요.
@@ -240,6 +240,8 @@ Go 1.26이 필요해요. 직접 의존성은 `github.com/google/nftables`
 | `PICKLE_RELAY_PER_SOURCE_RATE` / `_BURST` | | 출발지 IP당 신규 연결 pps 상한과 버스트 (기본 50/100, rate `0`이면 끔) |
 
 배포 값은 `/etc/pickle/relay-agent.env`(root 640)에 둬요. 이 레포지토리에는 없어요.
+
+최종 갱신: 2026-11-03
 
 ## 전체 아키텍처
 
